@@ -1,6 +1,6 @@
 pkgbase = gloview-git
 	pkgdesc = macOS Mission Control-style overview plugin for Hyprland
-	pkgver = 0.3.0.r2.f31fadd
+	pkgver = 0.3.0.r3.8f83476
 	pkgrel = 1
 	url = https://github.com/fedsfarm/gloview
 	install = gloview.install
