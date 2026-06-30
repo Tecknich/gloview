@@ -4,7 +4,7 @@
 # -git package that rebuilds against whatever `hyprland` is installed. Rebuild it every
 # time you update Hyprland, or it will refuse to load (or crash on load).
 pkgname=gloview-git
-pkgver=0.3.0.r2.098ced7
+pkgver=0.3.0.r2.f31fadd
 pkgrel=1
 pkgdesc="macOS Mission Control-style overview plugin for Hyprland"
 arch=('x86_64' 'aarch64')
@@ -15,6 +15,7 @@ depends=('hyprland')
 makedepends=('cmake' 'git' 'pkgconf' 'lua')
 provides=('gloview')
 conflicts=('gloview')
+install=gloview.install
 source=("$pkgname::git+https://github.com/fedsfarm/gloview.git")
 sha256sums=('SKIP')
 

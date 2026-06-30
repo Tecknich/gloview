@@ -1,7 +1,7 @@
 # GloView
 [![license](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://github.com/fedsfarm/gloview/blob/main/LICENSE) [![#main:feds.farm](https://escape.feds.farm/feds.png)](https://escape.feds.farm/#main:feds.farm)
 
-<video src="./gloview.mp4" controls width="600"></video>
+https://github.com/user-attachments/assets/0a3d812a-eae0-4ca5-8698-7a006e540857
 
 A better macOS Mission Control-style overview plugin for Hyprland
 
