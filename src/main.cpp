@@ -1,4 +1,5 @@
 #include <memory>
+#include <stdexcept>
 
 #include <hyprland/src/config/ConfigManager.hpp>
 #include <hyprland/src/debug/log/Logger.hpp>
@@ -142,8 +143,11 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     addColor("plugin:gloview:select_border", Config::INTEGER{0xf066ccffLL}); // keyboard-selected tile ring (distinct from hover)
 
     // --- keybinds (key names: esc/tab/enter/left/right/up/down/shift/hjkl/f1…/super/ctrl/alt;
-    //     a bare digit = that number-row key; comma/space separated; "" disables → key falls through) ---
-    addStr("plugin:gloview:key_close", "escape,tab");     // dismiss
+    //     a bare digit = that number-row key; comma/space separated; modifier combos as
+    //     "shift+tab" / "ctrl+shift+k"; "" disables → key falls through) ---
+    addStr("plugin:gloview:key_close", "escape");              // dismiss (tab now cycles workspaces; add it back here to restore the old behavior)
+    addStr("plugin:gloview:key_next_workspace", "tab");        // cycle the displayed workspace forward (wraps); "" disables
+    addStr("plugin:gloview:key_prev_workspace", "shift+tab");  // …backward
     addStr("plugin:gloview:key_activate", "enter");       // focus the selected tile
     addStr("plugin:gloview:key_close_window", "d");       // send-close the selected tile's window (stays open, reflows); "" disables
     addStr("plugin:gloview:key_left", "left");            // move selection
@@ -172,8 +176,16 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 
     g_overviewOwned = std::make_unique<gloview::Overview>(handle);
     g_overview      = g_overviewOwned.get();
-    if (!g_overview->initialize())
+    if (!g_overview->initialize()) {
         HyprlandAPI::addNotification(handle, "[gloview] initialization failed", CHyprColor(1.0, 0.2, 0.2, 1.0), 6000);
+        g_overview = nullptr;
+        g_overviewOwned.reset();
+        // Throw so Hyprland ejects the plugin (it catches this and runs unloadPlugin).
+        // Returning normally instead kept a half-alive instance loaded — dispatchers and
+        // config registered but no render hooks — which then blocked every later load
+        // attempt (two instances can't hook shouldRenderWindow twice).
+        throw std::runtime_error("[gloview] initialization failed");
+    }
 
     HyprlandAPI::addDispatcherV2(handle, "gloview:toggle", dispToggle);
     HyprlandAPI::addDispatcherV2(handle, "gloview:open", dispOpen);

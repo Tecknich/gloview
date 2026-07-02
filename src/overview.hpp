@@ -250,8 +250,8 @@ class Overview {
     double newCardScale() const;              // 0..1(+overshoot) pop-in scale for the just-added card
     float  blurStrength() const;              // plugin:gloview:blur as 0..1 (float); 0 = off
     // keyboard navigation
-    bool   keyMatches(int keycode, const char* cfgName, const char* fallback) const; // keycode ∈ the configured evdev list (comma/space separated; empty = disabled)
-    int    keyIndex(int keycode, const char* cfgName, const char* fallback) const;   // 0-based position of keycode in the list, else -1 (number-row → strip card N)
+    bool   keyMatches(int keycode, uint32_t mods, const char* cfgName, const char* fallback) const; // keycode+held mods ∈ the configured list (names or "shift+tab" combos; empty = disabled)
+    int    keyIndex(int keycode, uint32_t mods, const char* cfgName, const char* fallback) const;   // 0-based position of keycode in the list, else -1 (number-row → strip card N)
     void   moveSelection(int dx, int dy);     // step the selection cursor to the nearest tile in a direction
     void   activateSelection();               // focus the selected window and dismiss
     void   syncFocus() const;                 // point Hyprland's real focus at the selected tile (passthrough keybinds)

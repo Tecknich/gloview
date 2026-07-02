@@ -64,6 +64,25 @@ CBox box(const LRect& r) {
     return CBox{r.x, r.y, r.w, r.h};
 }
 
+// Hyprland's immediate-mode renderRect/renderTexture/renderRoundedShadow feed the box
+// STRAIGHT to projectBoxToTarget, which expects transformed monitor-PIXEL coordinates and
+// applies NO monitor scale itself (verified against Renderer.cpp: clipBox/scaledWindowBox are
+// pre-.scale(m_scale)'d before applyToBox). All gloview chrome is authored in monitor-LOGICAL
+// pixels, so it MUST be pre-scaled by mon->m_scale before drawing — otherwise on any monitor
+// with scale != 1 (HiDPI / fractional like 1.2) the whole chrome renders at 1/scale size and
+// top-left-biased, while the live window surfaces (renderWindowLive, which converts to pixels
+// itself) land correctly → the overview looks "distorted". Chrome-only; surfaces are already
+// pixel-space. Round radii / blur ranges scale too so corners/shadows keep their proportion.
+CBox pxb(const CBox& b, double s) {
+    return CBox{b.x * s, b.y * s, b.w * s, b.h * s};
+}
+CBox pxb(const LRect& r, double s) {
+    return CBox{r.x * s, r.y * s, r.w * s, r.h * s};
+}
+int pxr(double round, double s) {
+    return static_cast<int>(round * s);
+}
+
 LRect fitInside(const LRect& outer, double aspect) {
     if (outer.w <= 0.0 || outer.h <= 0.0 || aspect <= 0.0)
         return outer;
@@ -225,6 +244,17 @@ class COverlayPass final : public IPassElement {
     // live-blur framebuffer only from elements reporting true; false → stale blur residue.
     bool                needsLiveBlur() override { return (m_phase == Phase::Back || m_phase == Phase::Mid) && m_owner && m_owner->blurEnabled(); }
     bool                needsPrecomputeBlur() override { return false; }
+    // Occlusion culling must be off while the overview is up. The queued preview surfaces
+    // (CSurfacePassElement) report boundingBox/opaqueRegion at the window's REAL footprint —
+    // they can't see our translate+scale render-modif — so once the open animation settles
+    // (alpha hits 1, opaqueRegion turns non-empty) each preview "occludes" its real,
+    // often monitor-filling rect and CRenderPass::simplify() empties the damage of every
+    // element below it: backdrop, strip chrome, other previews, the background layer. With
+    // blur ≠ 0 needsLiveBlur() masked this (the live-blur region neutralizes all opaque
+    // subtraction in simplify()); with blur = 0 the overview drew for the open animation,
+    // then collapsed to bare wallpaper/stale frames. No perf cost: the overview damages the
+    // whole monitor every frame anyway, so there is nothing useful for simplify() to cull.
+    bool                disableSimplification() override { return true; }
     bool                undiscardable() override { return true; }
     const char*         passName() override { return "GloviewOverlayPass"; }
     ePassElementType    type() override { return EK_CUSTOM; }
@@ -315,7 +345,10 @@ bool Overview::initialize() {
     }
     m_shouldRenderHook = HyprlandAPI::createFunctionHook(m_handle, addr, reinterpret_cast<void*>(&hkShouldRenderWindow));
     if (!m_shouldRenderHook || !m_shouldRenderHook->hook()) {
-        HyprlandAPI::addNotification(m_handle, "[gloview] failed to hook shouldRenderWindow", CHyprColor(1.0, 0.2, 0.2, 1.0), 6000);
+        // Most common cause: ANOTHER gloview instance already holds this hook (e.g. the
+        // hyprpm-installed copy autoloaded at session start while the dev `reload` target
+        // loads the build path) — Hyprland can't trampoline an already-hooked prologue.
+        HyprlandAPI::addNotification(m_handle, "[gloview] failed to hook shouldRenderWindow — is another gloview instance loaded (hyprpm)?", CHyprColor(1.0, 0.2, 0.2, 1.0), 6000);
         return false;
     }
     g_shouldRenderOrig = reinterpret_cast<PSHOULDRENDER>(m_shouldRenderHook->m_original);
@@ -1194,7 +1227,8 @@ void Overview::renderBackdrop() const {
     const auto   col = argb(cfgColor("plugin:gloview:backdrop_color", 0x73070a10), e);
     if (col.a <= 0.0)
         return;
-    g_pHyprOpenGL->renderRect(CBox(0, 0, m->m_size.x, m->m_size.y), col, {.blur = blurEnabled(), .blurA = static_cast<float>(e) * blurStrength()});
+    const double s = m->m_scale;
+    g_pHyprOpenGL->renderRect(pxb(CBox(0, 0, m->m_size.x, m->m_size.y), s), col, {.blur = blurEnabled(), .blurA = static_cast<float>(e) * blurStrength()});
 }
 
 void Overview::renderStrip() const {
@@ -1204,6 +1238,7 @@ void Overview::renderStrip() const {
     const double e = eased();
     if (e <= 0.01)
         return;
+    const double s = m->m_scale; // logical→pixel; Hyprland's renderRect wants pixel coords
 
     // translucent band behind the cards (kept faint per request)
     const auto     bandCol = argb(cfgColor("plugin:gloview:strip_band_color", 0x24ffffff), e);
@@ -1211,7 +1246,7 @@ void Overview::renderStrip() const {
     const LRect    bandR   = stripBand();
     const Vector2D slide   = stripSlide(e);  // slide the whole strip in from its edge
     const Vector2D scroll  = stripScroll();  // scroll the card group along the band
-    g_pHyprOpenGL->renderRect(CBox(bandR.x + slide.x, bandR.y + slide.y, bandR.w, bandR.h), bandCol, {.blur = blur, .blurA = static_cast<float>(e) * blurStrength()});
+    g_pHyprOpenGL->renderRect(pxb(CBox(bandR.x + slide.x, bandR.y + slide.y, bandR.w, bandR.h), s), bandCol, {.blur = blur, .blurA = static_cast<float>(e) * blurStrength()});
 
     const int  cardRound  = cfgInt("plugin:gloview:strip_card_round", 10);
     const auto cardBg     = argb(cfgColor("plugin:gloview:strip_card_color", 0x3a0e131c), e);
@@ -1246,18 +1281,18 @@ void Overview::renderStrip() const {
         if (ring || hover) {
             const auto&  lc = ring ? activeLine : hoverLine;
             const double t  = actLike ? 2.5 : 2.0;
-            g_pHyprOpenGL->renderRect(CBox(c.x - t, c.y - t, c.w + 2 * t, c.h + 2 * t), lc, {.round = cardRound + static_cast<int>(t)});
+            g_pHyprOpenGL->renderRect(pxb(CBox(c.x - t, c.y - t, c.w + 2 * t, c.h + 2 * t), s), lc, {.round = pxr(cardRound + t, s)});
         }
 
-        g_pHyprOpenGL->renderRect(c, actLike ? activeBg : cardBg, {.round = cardRound});
+        g_pHyprOpenGL->renderRect(pxb(c, s), actLike ? activeBg : cardBg, {.round = pxr(cardRound, s)});
 
         if (it.isPlus) {
             // draw a centered plus
             const double t  = std::max(2.0, card.h * 0.04);
             const double L  = std::min(card.w, card.h) * 0.34;
             const double cx = card.cx(), cy = card.cy();
-            g_pHyprOpenGL->renderRect(CBox(cx - L / 2, cy - t / 2, L, t), plusCol, {.round = static_cast<int>(t / 2)});
-            g_pHyprOpenGL->renderRect(CBox(cx - t / 2, cy - L / 2, t, L), plusCol, {.round = static_cast<int>(t / 2)});
+            g_pHyprOpenGL->renderRect(pxb(CBox(cx - L / 2, cy - t / 2, L, t), s), plusCol, {.round = pxr(t / 2, s)});
+            g_pHyprOpenGL->renderRect(pxb(CBox(cx - t / 2, cy - L / 2, t, L), s), plusCol, {.round = pxr(t / 2, s)});
         } else if (it.isAll) {
             // 2x2 grid-of-squares glyph = "all windows / every workspace"
             const double pad = std::min(card.w, card.h) * 0.26;
@@ -1267,7 +1302,7 @@ void Overview::renderStrip() const {
             const double gx  = card.x + pad, gy = card.y + pad;
             for (int r = 0; r < 2; ++r)
                 for (int col = 0; col < 2; ++col)
-                    g_pHyprOpenGL->renderRect(CBox(gx + col * (cw + cg), gy + r * (ch + cg), cw, ch), plusCol, {.round = 2});
+                    g_pHyprOpenGL->renderRect(pxb(CBox(gx + col * (cw + cg), gy + r * (ch + cg), cw, ch), s), plusCol, {.round = pxr(2, s)});
         } else {
             // Opaque backing per window slot: the live surface (queued on top by
             // renderStripWindows) may carry transparency, so without it the translucent
@@ -1280,7 +1315,7 @@ void Overview::renderStrip() const {
                 // thin dark edge line (see drawPreviewTile).
                 const CBox wb(card.x + sw.rel.x * card.w + 1.0, card.y + sw.rel.y * card.h + 1.0,
                               std::max(2.0, sw.rel.w * card.w - 2.0), std::max(2.0, sw.rel.h * card.h - 2.0));
-                g_pHyprOpenGL->renderRect(wb, argb(0xff14181f, e), {.round = 4});
+                g_pHyprOpenGL->renderRect(pxb(wb, s), argb(0xff14181f, e), {.round = pxr(4, s)});
             }
         }
 
@@ -1299,7 +1334,7 @@ void Overview::renderStrip() const {
             const double lx        = card.cx() - lw / 2.0;
             const double ly        = card.y - labelBand + (labelBand - lh) / 2.0;
             const float  la        = it.active ? static_cast<float>(e) : static_cast<float>(e) * 0.75F;
-            g_pHyprOpenGL->renderTexture(it.label, CBox(lx, ly, lw, lh), {.a = la});
+            g_pHyprOpenGL->renderTexture(it.label, pxb(CBox(lx, ly, lw, lh), s), {.a = la});
         }
     }
 }
@@ -1332,8 +1367,8 @@ void Overview::renderStripWindows() const {
             // window slot inside the card, from its tiled goal position (logical)
             const LRect slot{card.x + sw.rel.x * card.w, card.y + sw.rel.y * card.h, std::max(2.0, sw.rel.w * card.w),
                              std::max(2.0, sw.rel.h * card.h)};
-            // renderWindowLive works in monitor PIXEL coords; the logical→pixel scale keeps
-            // it aligned with the logical-space card chrome at any monitor scale.
+            // renderWindowLive works in monitor PIXEL coords; the card chrome (renderStrip) is
+            // pre-scaled to pixels too (pxb), so surface and backing coincide at any monitor scale.
             const CBox slotPx(slot.x * scale, slot.y * scale, slot.w * scale, slot.h * scale);
             const CBox cardPx(card.x * scale, card.y * scale, card.w * scale, card.h * scale);
             renderWindowLive(w, m, slotPx, cardPx, static_cast<float>(e), when);
@@ -1354,6 +1389,7 @@ void Overview::drawPreviewTile(size_t i, const LRect& slot, bool lift) const {
     const auto m = m_monitor.lock();
     if (!m || i >= m_tiles.size())
         return;
+    const double s         = m->m_scale; // logical→pixel; Hyprland's renderRect wants pixel coords
     const double e         = eased();
     const int    round     = cfgInt("plugin:gloview:preview_round", 12);
     const auto   shadowCol = argb(cfgColor("plugin:gloview:shadow_color", 0x70000000), 1.0);
@@ -1372,7 +1408,7 @@ void Overview::drawPreviewTile(size_t i, const LRect& slot, bool lift) const {
     // the backdrop blur and reads as a murky halo.
     const double range = lift ? 30.0 : 16.0;
     const double dy    = lift ? 14.0 : 6.0;
-    g_pHyprOpenGL->renderRoundedShadow(box(LRect{lb.x, lb.y + dy, lb.w, lb.h}), round, 2.F, static_cast<int>(range), shadowCol, e * 0.9);
+    g_pHyprOpenGL->renderRoundedShadow(pxb(LRect{lb.x, lb.y + dy, lb.w, lb.h}, s), pxr(round, s), 2.F, static_cast<int>(range * s), shadowCol, e * 0.9);
 
     const bool   framed   = (static_cast<int>(i) == m_hovered || lift);
     const bool   selected = (static_cast<int>(i) == m_selected) && !lift; // keyboard-nav cursor
@@ -1382,12 +1418,12 @@ void Overview::drawPreviewTile(size_t i, const LRect& slot, bool lift) const {
     // clean ring. Hover ring takes precedence over the coincident keyboard selection ring.
     if (framed) {
         const CBox c = box(lb);
-        g_pHyprOpenGL->renderRect(CBox(c.x - th, c.y - th, c.w + 2 * th, c.h + 2 * th), hoverCol, {.round = round + static_cast<int>(th)});
+        g_pHyprOpenGL->renderRect(pxb(CBox(c.x - th, c.y - th, c.w + 2 * th, c.h + 2 * th), s), hoverCol, {.round = pxr(round + th, s)});
     } else if (selected) {
         const auto   selCol = argb(cfgColor("plugin:gloview:select_border", 0xf066ccff), e);
         const double st     = std::max(1, cfgInt("plugin:gloview:select_border_size", 3));
         const CBox   c      = box(lb);
-        g_pHyprOpenGL->renderRect(CBox(c.x - st, c.y - st, c.w + 2 * st, c.h + 2 * st), selCol, {.round = round + static_cast<int>(st)});
+        g_pHyprOpenGL->renderRect(pxb(CBox(c.x - st, c.y - st, c.w + 2 * st, c.h + 2 * st), s), selCol, {.round = pxr(round + st, s)});
     }
 
     // opaque backing under the live surface (transparent clients would leak the blurred
@@ -1395,17 +1431,17 @@ void Overview::drawPreviewTile(size_t i, const LRect& slot, bool lift) const {
     // pixel space, so on a fractional edge the backing is ~1px wider and peeks as a dark seam;
     // the inset keeps it under the over-covered surface.
     const LRect bb{lb.x + 1.0, lb.y + 1.0, std::max(0.0, lb.w - 2.0), std::max(0.0, lb.h - 2.0)};
-    g_pHyprOpenGL->renderRect(box(bb), argb(cfgColor("plugin:gloview:preview_bg", 0xff14181f), 1.0), {.round = round});
+    g_pHyprOpenGL->renderRect(pxb(bb, s), argb(cfgColor("plugin:gloview:preview_bg", 0xff14181f), 1.0), {.round = pxr(round, s)});
 
     // desktop (canvas) mode: a "✕" close button in the top-right of every preview.
     if (m_desktopMode && !lift) {
         const LRect br = closeButtonRect(lb);
-        g_pHyprOpenGL->renderRect(box(br), argb(cfgColor("plugin:gloview:close_button_color", 0xe6e23b3b), e), {.round = static_cast<int>(br.h / 2.0)});
+        g_pHyprOpenGL->renderRect(pxb(br, s), argb(cfgColor("plugin:gloview:close_button_color", 0xe6e23b3b), e), {.round = pxr(br.h / 2.0, s)});
         if (m_closeGlyph && m_closeGlyph->m_size.x > 0) {
             const double gw = m_closeGlyph->m_size.x, gh = m_closeGlyph->m_size.y;
-            const double s  = std::min((br.w * 0.62) / std::max(1.0, gw), (br.h * 0.62) / std::max(1.0, gh));
-            const double dw = gw * s, dh = gh * s;
-            g_pHyprOpenGL->renderTexture(m_closeGlyph, CBox(br.x + (br.w - dw) / 2.0, br.y + (br.h - dh) / 2.0, dw, dh), {.a = static_cast<float>(e)});
+            const double gs = std::min((br.w * 0.62) / std::max(1.0, gw), (br.h * 0.62) / std::max(1.0, gh));
+            const double dw = gw * gs, dh = gh * gs;
+            g_pHyprOpenGL->renderTexture(m_closeGlyph, pxb(CBox(br.x + (br.w - dw) / 2.0, br.y + (br.h - dh) / 2.0, dw, dh), s), {.a = static_cast<float>(e)});
         }
     }
 
@@ -1418,8 +1454,8 @@ void Overview::drawPreviewTile(size_t i, const LRect& slot, bool lift) const {
         const double ph   = lh + 2 * padY;
         const double px   = std::clamp(lb.cx() - pw / 2.0, 6.0, m->m_size.x - pw - 6.0);
         const double py   = std::min(lb.y + lb.h + 10.0, m->m_size.y - ph - 6.0);
-        g_pHyprOpenGL->renderRect(CBox(px, py, pw, ph), argb(0xcc11151c, e), {.round = static_cast<int>(ph / 2.0)});
-        g_pHyprOpenGL->renderTexture(t.label, CBox(px + padX, py + padY, lw, lh), {.a = static_cast<float>(e)});
+        g_pHyprOpenGL->renderRect(pxb(CBox(px, py, pw, ph), s), argb(0xcc11151c, e), {.round = pxr(ph / 2.0, s)});
+        g_pHyprOpenGL->renderTexture(t.label, pxb(CBox(px + padX, py + padY, lw, lh), s), {.a = static_cast<float>(e)});
     }
 }
 
@@ -1603,7 +1639,7 @@ void Overview::renderCursorOnTop() const {
         return;
     const CBox g  = g_pPointerManager->getCursorBoxGlobal();
     const CBox lb(g.x - m->m_position.x, g.y - m->m_position.y, g.w, g.h);
-    g_pHyprOpenGL->renderTexture(tex, lb, {.a = 1.0F});
+    g_pHyprOpenGL->renderTexture(tex, pxb(lb, m->m_scale), {.a = 1.0F});
 }
 
 // ---- input ------------------------------------------------------------------
@@ -1986,6 +2022,24 @@ void Overview::switchToWorkspace(const StripItem& it) {
     damage();
 }
 
+namespace {
+// The modifier bit a pressed key ITSELF contributes (evdev codes), so bare modifier
+// bindings can mask their own bit out of the held-mods state before matching.
+uint32_t modBitForKeycode(int kc) {
+    switch (kc) {
+        case 42:
+        case 54: return HL_MODIFIER_SHIFT;
+        case 29:
+        case 97: return HL_MODIFIER_CTRL;
+        case 56:
+        case 100: return HL_MODIFIER_ALT;
+        case 125:
+        case 126: return HL_MODIFIER_META;
+        default: return 0;
+    }
+}
+} // namespace
+
 void Overview::onKey(const IKeyboard::SKeyEvent& e, bool& cancel) {
     if (!m_active)
         return;
@@ -2001,28 +2055,38 @@ void Overview::onKey(const IKeyboard::SKeyEvent& e, bool& cancel) {
     }
 
     // Each action binds a config list of key NAMES (esc/tab/enter/left/shift/hjkl/…;
-    // bare digit = number-row key). key_* = "" disables the action (key falls through).
-    const int k       = e.keycode;
-    bool      handled = true;
-    if (keyMatches(k, "plugin:gloview:key_close", "escape,tab"))
+    // bare digit = number-row key), optionally with modifier prefixes ("shift+tab").
+    // key_* = "" disables the action (key falls through).
+    const int k = e.keycode;
+    // Held modifiers across all keyboards (not just keys pressed since the overview
+    // opened), minus the pressed key's OWN modifier bit — else a bare modifier name
+    // ("shift", the key_desktop default) could never match its own press.
+    uint32_t mods = g_pInputManager ? g_pInputManager->getModsFromAllKBs() : 0;
+    mods &= ~modBitForKeycode(k);
+    bool handled = true;
+    if (keyMatches(k, mods, "plugin:gloview:key_close", "escape"))
         close();
-    else if (keyMatches(k, "plugin:gloview:key_activate", "enter"))
+    else if (keyMatches(k, mods, "plugin:gloview:key_next_workspace", "tab"))
+        stepWorkspace(1); // cycle the displayed workspace card (wraps; committed on close)
+    else if (keyMatches(k, mods, "plugin:gloview:key_prev_workspace", "shift+tab"))
+        stepWorkspace(-1);
+    else if (keyMatches(k, mods, "plugin:gloview:key_activate", "enter"))
         activateSelection();
-    else if (keyMatches(k, "plugin:gloview:key_close_window", "d"))
+    else if (keyMatches(k, mods, "plugin:gloview:key_close_window", "d"))
         closeTileWindow(m_selected); // sendClose the SELECTED tile (keyboard/hover cursor), stay open & reflow
-    else if (keyMatches(k, "plugin:gloview:key_left", "left"))
+    else if (keyMatches(k, mods, "plugin:gloview:key_left", "left"))
         moveSelection(-1, 0);
-    else if (keyMatches(k, "plugin:gloview:key_right", "right"))
+    else if (keyMatches(k, mods, "plugin:gloview:key_right", "right"))
         moveSelection(1, 0);
-    else if (keyMatches(k, "plugin:gloview:key_up", "up"))
+    else if (keyMatches(k, mods, "plugin:gloview:key_up", "up"))
         moveSelection(0, -1);
-    else if (keyMatches(k, "plugin:gloview:key_down", "down"))
+    else if (keyMatches(k, mods, "plugin:gloview:key_down", "down"))
         moveSelection(0, 1);
-    else if (keyMatches(k, "plugin:gloview:key_desktop", "shift"))
+    else if (keyMatches(k, mods, "plugin:gloview:key_desktop", "shift"))
         setDesktopMode(!m_desktopMode);
-    else if (keyMatches(k, "plugin:gloview:key_all_workspaces", "a"))
+    else if (keyMatches(k, mods, "plugin:gloview:key_all_workspaces", "a"))
         toggleAllWorkspaces(); // flip the expo (all-workspaces) main view
-    else if (const int ws = keyIndex(k, "plugin:gloview:key_workspace", "1,2,3,4,5,6,7,8,9,0"); ws >= 0) {
+    else if (const int ws = keyIndex(k, mods, "plugin:gloview:key_workspace", "1,2,3,4,5,6,7,8,9,0"); ws >= 0) {
         // number-row 1..0 → switch to the Nth (non-"+") card's workspace, in the overview
         // AND for real now. Update m_liveWsAtOpen so the exit_on_switch poll doesn't read
         // this self-switch as external.
@@ -2095,26 +2159,72 @@ const std::vector<int>& keyNameToCodes(std::string t) {
     const auto it = M.find(t);
     return it != M.end() ? it->second : NONE;
 }
+
+// Modifier NAME (a "+"-prefix in a combo token) → HL_MODIFIER bit; 0 = not a modifier.
+uint32_t modNameToBit(std::string t) {
+    for (auto& c : t)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (t == "shift")
+        return HL_MODIFIER_SHIFT;
+    if (t == "ctrl" || t == "control")
+        return HL_MODIFIER_CTRL;
+    if (t == "alt")
+        return HL_MODIFIER_ALT;
+    if (t == "super" || t == "meta" || t == "win")
+        return HL_MODIFIER_META;
+    return 0;
+}
+
+// Match one token ("tab", "shift+tab", "ctrl+shift+k") against the pressed keycode and
+// the currently held modifiers — EXACT on shift/ctrl/alt/super. Unrequested modifiers
+// must NOT be held: a bare "tab" must not swallow shift+tab (its own action) nor
+// super+tab (commonly the user's gloview:toggle bind — with passthrough it falls
+// through to Hyprland's keybind manager, so the same bind that opened the overview
+// closes it). Only lock states (caps/num) are ignored.
+bool comboMatches(int keycode, uint32_t heldMods, std::string token) {
+    constexpr uint32_t STRICTMODS = HL_MODIFIER_SHIFT | HL_MODIFIER_CTRL | HL_MODIFIER_ALT | HL_MODIFIER_META;
+
+    uint32_t           need = 0;
+    size_t             pos;
+    while ((pos = token.find('+')) != std::string::npos) {
+        const uint32_t bit = modNameToBit(token.substr(0, pos));
+        if (bit == 0)
+            return false; // unknown modifier name → the token can never match
+        need |= bit;
+        token.erase(0, pos + 1);
+    }
+
+    bool codeHit = false;
+    for (const int c : keyNameToCodes(token))
+        if (c == keycode) {
+            codeHit = true;
+            break;
+        }
+    if (!codeHit)
+        return false;
+    if ((heldMods & need) != need)
+        return false;
+    return (heldMods & STRICTMODS & ~need) == 0;
+}
 } // namespace
 
-// keycode bound by the configured key list? (comma/space separated names; bare digit =
-// number-row key). Empty config → no match (action disabled, key falls through).
-bool Overview::keyMatches(int keycode, const char* cfgName, const char* fallback) const {
+// keycode+mods bound by the configured key list? (comma/space separated names; bare digit
+// = number-row key; "shift+tab"-style combos). Empty config → no match (action disabled,
+// key falls through).
+bool Overview::keyMatches(int keycode, uint32_t mods, const char* cfgName, const char* fallback) const {
     for (const auto& tok : keyTokens(cfgStr(cfgName, fallback)))
-        for (const int c : keyNameToCodes(tok))
-            if (c == keycode)
-                return true;
+        if (comboMatches(keycode, mods, tok))
+            return true;
     return false;
 }
 
 // 0-based token position of keycode within the list, else -1. The number row uses
 // it: the matched token's slot in key_workspace selects strip card N.
-int Overview::keyIndex(int keycode, const char* cfgName, const char* fallback) const {
+int Overview::keyIndex(int keycode, uint32_t mods, const char* cfgName, const char* fallback) const {
     int idx = 0;
     for (const auto& tok : keyTokens(cfgStr(cfgName, fallback))) {
-        for (const int c : keyNameToCodes(tok))
-            if (c == keycode)
-                return idx;
+        if (comboMatches(keycode, mods, tok))
+            return idx;
         ++idx;
     }
     return -1;

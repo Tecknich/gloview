@@ -57,6 +57,11 @@ add_custom_target(reload
   COMMAND bash -c "hyprctl gloviewunload || true"
   COMMAND ${CMAKE_COMMAND} -E sleep 0.15
   COMMAND bash -c "hyprctl plugin unload $<TARGET_FILE:gloview> || true"
+  # Also drop a hyprpm-installed copy: it autoloads at session start and already holds the
+  # shouldRenderWindow hooks, so loading the build path next to it fails to hook (two
+  # instances can't trampoline the same prologue). No-op when not installed/loaded.
+  # ($ENV{USER} resolves at configure time — a literal $USER gets mangled by the Makefile.)
+  COMMAND bash -c "hyprctl plugin unload /var/cache/hyprpm/$ENV{USER}/gloview/gloview.so || true"
   COMMAND hyprctl plugin load $<TARGET_FILE:gloview>
   DEPENDS gloview
   USES_TERMINAL

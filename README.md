@@ -104,7 +104,9 @@ All keys live under `plugin:gloview:*`. Colors are `0xAARRGGBB` integers.
 | `focus_follows_mouse` | bool (0/1) | `1` | Keyboard selection tracks the hovered preview |
 | `scroll_switches_workspace` | bool (0/1) | `1` | Wheel over the main area steps prev/next workspace |
 | `passthrough_keys` | bool (0/1) | `1` | Let keys the overview doesn't use reach Hyprland (keybinds keep working) |
-| `key_close` | key names | `escape,tab` | Keys that dismiss |
+| `key_close` | key names | `escape` | Keys that dismiss |
+| `key_next_workspace` | key names | `tab` | Cycle the displayed workspace forward (wraps); `""` to disable. Held modifiers match exactly, so e.g. a `SUPER+Tab` toggle bind still passes through and closes |
+| `key_prev_workspace` | key names | `shift+tab` | Cycle the displayed workspace backward (`mod+key` combos supported: `shift`/`ctrl`/`alt`/`super`) |
 | `key_activate` | key names | `enter` | Keys that focus the selected preview |
 | `key_close_window` | key names | `d` | Keys that close the selected preview's window (overview stays open); `""` to disable |
 | `key_left` / `key_right` / `key_up` / `key_down` | key names | `left` / `right` / `up` / `down` | Move the keyboard selection (e.g. set `h`/`l`/`k`/`j` for vim nav) |
@@ -158,7 +160,9 @@ supersedes the older `bar_position` (top/bottom only); set `anchor` and it wins.
                 exit_on_click             = 1,
                 exit_on_switch            = 0,
 
-                key_close     = "escape,tab",
+                key_close     = "escape",
+                key_next_workspace = "tab",
+                key_prev_workspace = "shift+tab",
                 key_activate  = "enter",
                 key_close_window = "d",
                 key_left      = "left",
@@ -227,7 +231,9 @@ plugin {
         exit_on_click             = 1
         exit_on_switch            = 0
 
-        key_close     = escape,tab
+        key_close     = escape
+        key_next_workspace = tab
+        key_prev_workspace = shift+tab
         key_activate  = enter
         key_close_window = d
         key_left      = left
