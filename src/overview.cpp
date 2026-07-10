@@ -1122,7 +1122,7 @@ double Overview::tileBaseProgress() const {
     // During a drop reflow the tiles glide on their own timer while the chrome
     // (m_progress) stays pinned at 1; everywhere else they ride m_progress.
     if (m_reflowing) {
-        const double dur = std::max(1, cfgInt("plugin:gloview:duration", 360));
+        const double dur = m_reflowDur > 0.0 ? m_reflowDur : std::max(1, cfgInt("plugin:gloview:duration", 360));
         return std::clamp(nowMs(m_reflowStart) / dur, 0.0, 1.0);
     }
     return m_progress;
@@ -1150,7 +1150,7 @@ void Overview::updateAnimation() {
     const double dur = std::max(1, cfgInt("plugin:gloview:duration", 360));
     const double t   = std::clamp(nowMs(m_animStart) / dur, 0.0, 1.0);
     m_progress       = m_opening ? t : 1.0 - t;
-    if (m_reflowing && nowMs(m_reflowStart) >= dur)
+    if (m_reflowing && nowMs(m_reflowStart) >= (m_reflowDur > 0.0 ? m_reflowDur : dur))
         m_reflowing = false;
     if (m_newCardAnim && nowMs(m_newCardStart) >= std::max(120, cfgInt("plugin:gloview:duration", 360))) {
         m_newCardAnim = false;
@@ -2070,7 +2070,7 @@ void Overview::swapTiles(int a, int b) {
     damage();
 }
 
-void Overview::switchToWorkspace(const StripItem& it) {
+void Overview::switchToWorkspace(const StripItem& it, int slideDir) {
     const auto m = m_monitor.lock();
     if (!m)
         return;
@@ -2094,16 +2094,32 @@ void Overview::switchToWorkspace(const StripItem& it) {
     // captureSnapshots() force-renders inactive workspaces without a real slide.
     m_workspace = ws;
 
-    // Rebuild around the displayed workspace and keep the overview visually
-    // settled; clicking strip cards should not replay the opening animation.
     m_hovered = m_hoveredStrip = -1;
     buildTiles();
     buildStrip();
     layoutTiles();
+
+    // Chrome (backdrop/strip) stays pinned settled either way -- no re-fade on a switch.
+    const auto   now = std::chrono::steady_clock::now();
+    const double dur = std::max(1, cfgInt("plugin:gloview:duration", 360));
     m_progress  = 1.0;
     m_opening   = true;
-    m_reflowing = false;
-    m_animStart = std::chrono::steady_clock::now() - std::chrono::milliseconds(std::max(1, cfgInt("plugin:gloview:duration", 360)));
+    m_animStart = now - std::chrono::milliseconds(static_cast<long>(dur));
+
+    const int slideMs = cfgInt("plugin:gloview:switch_slide", 0);
+    if (slideDir != 0 && slideMs > 0) {
+        // Slide the new workspace's previews in from the step direction, reusing the reflow
+        // glide path (only the tiles move). m_reflowDur gives it its own, snappier timing.
+        const double dist = m->m_size.x;
+        for (auto& t : m_tiles)
+            t.natural = LRect{t.target.x + slideDir * dist, t.target.y, t.target.w, t.target.h};
+        m_reflowing   = true;
+        m_reflowStart = now;
+        m_reflowDur   = std::max(1, slideMs);
+    } else {
+        m_reflowing = false;
+        m_reflowDur = 0.0;
+    }
     damage();
 }
 
@@ -2413,6 +2429,7 @@ void Overview::replayReflow(std::vector<std::pair<PHLWINDOW, LRect>>& oldBoxes) 
     m_progress     = 1.0;
     m_opening      = true;
     m_animStart    = now - std::chrono::milliseconds(std::max(1, cfgInt("plugin:gloview:duration", 360)));
+    m_reflowDur    = 0.0; // drops/swaps glide at the default duration
     m_reflowing    = true;
     m_reflowStart  = now;
     damage();
@@ -2520,7 +2537,7 @@ void Overview::stepWorkspace(int dir) {
     } else {
         if (expo)
             toggleAllWorkspaces(); // leaving expo for a workspace -> exit it (reflows to displayed ws)
-        switchToWorkspace(target); // then show the target workspace (no-op if already displayed)
+        switchToWorkspace(target, dir); // then show it, sliding the previews in the step direction
     }
 }
 

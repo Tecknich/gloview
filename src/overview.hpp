@@ -153,6 +153,7 @@ class Overview {
     // the strip no longer re-slides and the backdrop no longer flashes on a drop.
     bool                                  m_reflowing = false;
     std::chrono::steady_clock::time_point m_reflowStart;
+    double                                m_reflowDur = 0.0;  // reflow duration override (ms); 0 = plugin:gloview:duration
     PHLMONITORREF                         m_monitor;
     PHLWORKSPACEREF                       m_workspace;    // workspace shown in the main area
     PHLWORKSPACEREF                       m_liveWsAtOpen; // monitor's live active workspace when opened (exit_on_switch)
@@ -251,7 +252,7 @@ class Overview {
     LRect  tileContentBox(size_t i, const LRect& slot) const; // slot fitted to the window's aspect
     LRect  dragBox() const;                        // the picked-up tile's box at the cursor
     void   drawPreviewTile(size_t i, const LRect& slot, bool lift) const; // tile chrome (shadow/border/backing/title)
-    void   switchToWorkspace(const StripItem& it);
+    void   switchToWorkspace(const StripItem& it, int slideDir = 0);
     void   dropOnWorkspace(const PHLWINDOW& w, const StripItem& it);
     void   swapTiles(int a, int b);           // drag a preview onto another → swap the two windows' places (real layout + overview)
     void   addWorkspace();                    // "+" card: create a workspace (animate it in, optionally follow)

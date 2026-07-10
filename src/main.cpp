@@ -136,6 +136,9 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     // --- input / keyboard navigation ---
     addInt("plugin:gloview:focus_follows_mouse", Config::INTEGER{1});      // keyboard selection tracks the hovered tile
     addInt("plugin:gloview:scroll_switches_workspace", Config::INTEGER{1});// wheel over the main area steps prev/next workspace
+    addInt("plugin:gloview:scroll_workspace_cooldown", Config::INTEGER{130}); // min ms between workspace steps (3-finger swipe pacing)
+    addInt("plugin:gloview:swipe_close_distance", Config::INTEGER{120});    // vertical 3-finger swipe distance (px) that closes the overview
+    addInt("plugin:gloview:switch_slide", Config::INTEGER{0});              // ms: slide previews in on a scroll/swipe workspace step (0 = instant)
     addInt("plugin:gloview:passthrough_keys", Config::INTEGER{1});         // unhandled keys reach Hyprland (keybinds keep working)
     addInt("plugin:gloview:exit_on_click", Config::INTEGER{1});           // click on empty space dismisses the overview
     addInt("plugin:gloview:debug_logs", Config::INTEGER{0});              // verbose [gloview] logging
