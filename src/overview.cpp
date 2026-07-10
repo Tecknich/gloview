@@ -1661,22 +1661,31 @@ bool Overview::onMouseAxis(const IPointer::SAxisEvent& e) {
         overStrip         = (lx >= band.x && ly >= band.y && lx <= band.x + band.w && ly <= band.y + band.h);
     }
 
+    // A full-width strip band with nothing to scroll (cards fit -> m_stripScrollMax == 0) must
+    // not hijack the wheel: under anchor=top it covers the whole top of the screen and would
+    // swallow every scroll landing there as a no-op. Demote it so those events fall through to
+    // workspace stepping; when the strip actually overflows it stays active and still scrolls.
+    if (overStrip && m_stripScrollMax <= 0.0)
+        overStrip = false;
+
     if (!overStrip && cfgInt("plugin:gloview:scroll_switches_workspace", 1) != 0) {
-        // Step per ACCUMULATED notch, not per event. A discrete wheel notch is +/-1.0 so it
-        // still steps once per click, but a high-res touchpad emits a stream of fractional-
-        // delta events per swipe -- stepping on every nonzero one blew through dozens of
-        // workspaces at once. Accumulate and step only when a whole notch is crossed;
-        // scroll_workspace_sensitivity scales how far a touchpad swipe must travel.
-        if (notches * m_wsScrollAccum < 0.0)
-            m_wsScrollAccum = 0.0; // direction reversed -> drop the stale partial, switch crisply
-        m_wsScrollAccum += notches * std::max(0.05F, cfgFloat("plugin:gloview:scroll_workspace_sensitivity", 1.0F));
-        while (m_wsScrollAccum >= 1.0) {
-            stepWorkspace(1);
-            m_wsScrollAccum -= 1.0;
-        }
-        while (m_wsScrollAccum <= -1.0) {
-            stepWorkspace(-1);
-            m_wsScrollAccum += 1.0;
+        // Step per scroll SOURCE, not per accumulated magnitude. A touchpad reports source
+        // FINGER/CONTINUOUS and never populates deltaDiscrete, so the old delta/15 accumulator
+        // stayed far below 1.0 and never stepped; a real wheel notch is deltaDiscrete = +/-1.
+        // Wheel: one workspace per notch. Touchpad: one step per cooldown window so a fast
+        // swipe can't fly through dozens of workspaces at once. notches is used for sign only.
+        if (notches != 0.0) {
+            const int dir = notches > 0 ? 1 : -1;
+            if (e.source == WL_POINTER_AXIS_SOURCE_WHEEL) {
+                stepWorkspace(dir);
+            } else {
+                const auto now = std::chrono::steady_clock::now();
+                if (std::chrono::duration_cast<std::chrono::milliseconds>(now - m_lastWsScroll).count() >=
+                    std::max(0, cfgInt("plugin:gloview:scroll_workspace_cooldown", 130))) {
+                    stepWorkspace(dir);
+                    m_lastWsScroll = now;
+                }
+            }
         }
         return true;
     }
@@ -2612,7 +2621,7 @@ void Overview::deactivate() {
     m_strip.clear();
     m_hovered = m_hoveredStrip = -1;
     m_selected = -1;
-    m_wsScrollAccum = 0.0;
+    m_lastWsScroll = {};
     m_recaptureLeft = 0;
     if (m_recaptureTimer)
         m_recaptureTimer->cancel();

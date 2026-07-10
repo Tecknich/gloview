@@ -188,7 +188,7 @@ class Overview {
     PHLWORKSPACEREF                       m_newWs;            // freshly "+"-created ws, held persistent until close so it isn't reaped empty
     double                                m_stripScroll = 0.0;    // strip group scroll offset along its main axis
     double                                m_stripScrollMax = 0.0; // max scroll (0 when the cards fit the band)
-    double                                m_wsScrollAccum = 0.0;  // fractional workspace-scroll accumulator (touchpad)
+    std::chrono::steady_clock::time_point m_lastWsScroll;         // last touchpad workspace-step time (cooldown throttle; default-ctor == epoch so the first scroll always fires)
     SP<CEventLoopTimer>                   m_recaptureTimer;    // off-render-loop re-snapshot after a drop (makeSnapshot mid-render crashes)
     int                                   m_recaptureLeft = 0; // remaining recapture ticks while windows repaint at their new size
 
