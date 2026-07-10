@@ -1675,7 +1675,7 @@ bool Overview::onMouseAxis(const IPointer::SAxisEvent& e) {
         // Wheel: one workspace per notch. Touchpad: one step per cooldown window so a fast
         // swipe can't fly through dozens of workspaces at once. notches is used for sign only.
         if (notches != 0.0) {
-            const int dir = notches > 0 ? 1 : -1;
+            const int dir = notches > 0 ? -1 : 1; // reversed: scroll one way steps the opposite direction
             if (e.source == WL_POINTER_AXIS_SOURCE_WHEEL) {
                 stepWorkspace(dir);
             } else {
@@ -2432,32 +2432,47 @@ void Overview::syncTiles() {
     replayReflow(oldBoxes);
 }
 
-// Scroll wheel over the main area: show the previous/next workspace card (wraps).
+// Scroll wheel over the main area: step to the previous/next strip card (wraps). The cycle is
+// the leading "All" card (if present) + every real workspace card, in strip order; only the
+// trailing "+" card is excluded. This lets scroll reach the expo (All) view too.
 void Overview::stepWorkspace(int dir) {
     if (m_strip.empty())
         return;
-    // collect only the real workspace cards (skip the "+" and the optional "All" card),
-    // then step within that list so the wrap can't land on a non-workspace card.
-    std::vector<int> real;
+    // Build the steppable card list and find the active slot: the "All" card when expo is on,
+    // otherwise the displayed workspace card.
+    const bool       expo = showAllWorkspaces();
+    std::vector<int> cyc;
     int              activePos = -1;
     for (size_t i = 0; i < m_strip.size(); ++i) {
-        if (m_strip[i].isPlus || m_strip[i].isAll)
+        if (m_strip[i].isPlus)
             continue;
-        if (m_strip[i].active)
-            activePos = static_cast<int>(real.size());
-        real.push_back(static_cast<int>(i));
+        if (m_strip[i].isAll) {
+            if (expo)
+                activePos = static_cast<int>(cyc.size());
+        } else if (!expo && m_strip[i].active)
+            activePos = static_cast<int>(cyc.size());
+        cyc.push_back(static_cast<int>(i));
     }
-    if (real.empty())
-        return; // only the "+"/"All" cards
+    if (cyc.empty())
+        return; // only the "+" card
     if (activePos < 0)
         activePos = 0;
     int next = activePos + (dir > 0 ? 1 : -1);
     if (next < 0)
-        next = static_cast<int>(real.size()) - 1; // wrap to last
-    else if (next >= static_cast<int>(real.size()))
+        next = static_cast<int>(cyc.size()) - 1; // wrap to last
+    else if (next >= static_cast<int>(cyc.size()))
         next = 0;                                 // wrap to first
-    if (next != activePos)
-        switchToWorkspace(m_strip[real[next]]);
+    if (next == activePos)
+        return;
+    // Copy the target: toggleAllWorkspaces()/switchToWorkspace rebuild m_strip, invalidating refs.
+    const StripItem target = m_strip[cyc[next]];
+    if (target.isAll) {
+        toggleAllWorkspaces();     // stepping onto "All" from a workspace -> enter the expo view
+    } else {
+        if (expo)
+            toggleAllWorkspaces(); // leaving expo for a workspace -> exit it (reflows to displayed ws)
+        switchToWorkspace(target); // then show the target workspace (no-op if already displayed)
+    }
 }
 
 // Fade out bars/popups so they don't bleed through the translucent backdrop: stash each
