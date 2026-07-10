@@ -86,6 +86,11 @@ class Overview {
     bool onMouseButton(const IPointer::SButtonEvent& e);
     bool onMouseAxis(const IPointer::SAxisEvent& e); // scroll the workspace strip when it overflows
     void onMouseMove();
+    // 3-finger swipe -> owned by the overview while open: horizontal steps workspaces (like a
+    // 2-finger scroll), vertical closes; the event is cancelled so native gestures don't fire behind.
+    bool onSwipeBegin(const IPointer::SSwipeBeginEvent& e);
+    bool onSwipeUpdate(const IPointer::SSwipeUpdateEvent& e);
+    bool onSwipeEnd();
     void updateHover(); // recompute hovered tile/card from current cursor pos
     void onKey(const IKeyboard::SKeyEvent& e, bool& cancel);
     bool shouldHideWindow(const PHLWINDOW& w, const PHLMONITOR& m) const;
@@ -189,6 +194,8 @@ class Overview {
     double                                m_stripScroll = 0.0;    // strip group scroll offset along its main axis
     double                                m_stripScrollMax = 0.0; // max scroll (0 when the cards fit the band)
     std::chrono::steady_clock::time_point m_lastWsScroll;         // last touchpad workspace-step time (cooldown throttle; default-ctor == epoch so the first scroll always fires)
+    double                                m_swipeDX = 0.0, m_swipeDY = 0.0; // 3-finger swipe delta accumulators (owned while open)
+    bool                                  m_swipeStepped = false;           // stepped a workspace this swipe? (blocks the vertical-close)
     SP<CEventLoopTimer>                   m_recaptureTimer;    // off-render-loop re-snapshot after a drop (makeSnapshot mid-render crashes)
     int                                   m_recaptureLeft = 0; // remaining recapture ticks while windows repaint at their new size
 
@@ -204,6 +211,9 @@ class Overview {
     CHyprSignalListener m_mouseAxisL;
     CHyprSignalListener m_mouseMoveL;
     CHyprSignalListener m_keyL;
+    CHyprSignalListener m_swipeBeginL;
+    CHyprSignalListener m_swipeUpdateL;
+    CHyprSignalListener m_swipeEndL;
     CFunctionHook*      m_shouldRenderHook = nullptr;
     CFunctionHook*      m_shouldRenderWindowHook = nullptr; // one-arg shouldRenderWindow, used by makeSnapshot()
 

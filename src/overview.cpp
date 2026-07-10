@@ -323,6 +323,20 @@ bool Overview::initialize() {
         if (cancel)
             info.cancelled = true;
     });
+    // 3-finger swipes: owned while the overview is open (horizontal steps workspaces, vertical
+    // closes) and cancelled so Hyprland's native swipe gestures (workspace switch) don't fire behind.
+    m_swipeBeginL  = events.gesture.swipe.begin.listen([this](const IPointer::SSwipeBeginEvent& event, Event::SCallbackInfo& info) {
+        if (onSwipeBegin(event))
+            info.cancelled = true;
+    });
+    m_swipeUpdateL = events.gesture.swipe.update.listen([this](const IPointer::SSwipeUpdateEvent& event, Event::SCallbackInfo& info) {
+        if (onSwipeUpdate(event))
+            info.cancelled = true;
+    });
+    m_swipeEndL    = events.gesture.swipe.end.listen([this](const IPointer::SSwipeEndEvent&, Event::SCallbackInfo& info) {
+        if (onSwipeEnd())
+            info.cancelled = true;
+    });
 
     const auto matches = HyprlandAPI::findFunctionsByName(m_handle, "shouldRenderWindow");
     void*      addr    = nullptr;
@@ -1669,24 +1683,12 @@ bool Overview::onMouseAxis(const IPointer::SAxisEvent& e) {
         overStrip = false;
 
     if (!overStrip && cfgInt("plugin:gloview:scroll_switches_workspace", 1) != 0) {
-        // Step per scroll SOURCE, not per accumulated magnitude. A touchpad reports source
-        // FINGER/CONTINUOUS and never populates deltaDiscrete, so the old delta/15 accumulator
-        // stayed far below 1.0 and never stepped; a real wheel notch is deltaDiscrete = +/-1.
-        // Wheel: one workspace per notch. Touchpad: one step per cooldown window so a fast
-        // swipe can't fly through dozens of workspaces at once. notches is used for sign only.
-        if (notches != 0.0) {
-            const int dir = notches > 0 ? -1 : 1; // reversed: scroll one way steps the opposite direction
-            if (e.source == WL_POINTER_AXIS_SOURCE_WHEEL) {
-                stepWorkspace(dir);
-            } else {
-                const auto now = std::chrono::steady_clock::now();
-                if (std::chrono::duration_cast<std::chrono::milliseconds>(now - m_lastWsScroll).count() >=
-                    std::max(0, cfgInt("plugin:gloview:scroll_workspace_cooldown", 130))) {
-                    stepWorkspace(dir);
-                    m_lastWsScroll = now;
-                }
-            }
-        }
+        // Only a real mouse WHEEL steps workspaces here (one per notch). A 2-finger touchpad scroll
+        // (source FINGER/CONTINUOUS) does NOTHING: workspace nav on the touchpad is the 3-finger
+        // swipe (onSwipeUpdate). Swallow either way so a 2-finger scroll never reaches a window
+        // behind the modal overview.
+        if (e.source == WL_POINTER_AXIS_SOURCE_WHEEL && notches != 0.0)
+            stepWorkspace(notches > 0 ? -1 : 1); // reversed direction
         return true;
     }
 
@@ -1698,6 +1700,53 @@ bool Overview::onMouseAxis(const IPointer::SAxisEvent& e) {
     updateHover(); // the card under the cursor changed
     damage();
     return true;
+}
+
+// ---- 3-finger swipe (trackpad gesture) --------------------------------------
+// While the overview is open gloview OWNS 3-finger swipes: a horizontal one steps through the
+// workspace strip exactly like a 2-finger scroll, a vertical one closes the overview, and the
+// event is swallowed so Hyprland's native swipe gestures (workspace switch -> the "background
+// jut") never fire behind it. While closed we cancel nothing, so the native open/switch gestures
+// keep working.
+bool Overview::onSwipeBegin(const IPointer::SSwipeBeginEvent& e) {
+    if (!m_active || e.fingers < 3)
+        return false;
+    m_swipeDX = m_swipeDY = 0.0;
+    m_swipeStepped        = false;
+    return true; // swallow so the native gesture never engages
+}
+
+bool Overview::onSwipeUpdate(const IPointer::SSwipeUpdateEvent& e) {
+    if (!m_active || e.fingers < 3)
+        return false;
+    m_swipeDX += e.delta.x;
+    m_swipeDY += e.delta.y;
+    // Horizontal-dominant swipe steps workspaces, time-throttled with the SAME cooldown as the
+    // 2-finger scroll (scroll_workspace_cooldown) so a 3-finger flick is just as snappy. The small
+    // distance gate keeps an almost-vertical swipe from stealing a step before its intent is clear.
+    if (std::abs(m_swipeDX) > std::abs(m_swipeDY) && std::abs(m_swipeDX) >= 20.0) {
+        const auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(now - m_lastWsScroll).count() >=
+            std::max(0, cfgInt("plugin:gloview:scroll_workspace_cooldown", 130))) {
+            stepWorkspace(m_swipeDX > 0 ? 1 : -1); // reversed per request
+            m_lastWsScroll = now;
+            m_swipeStepped = true;
+        }
+    }
+    return true; // swallow (no background jut)
+}
+
+bool Overview::onSwipeEnd() {
+    if (!m_active)
+        return false;
+    // A clean vertical flick that never stepped a workspace closes the overview, mirroring the
+    // 3-finger vertical open gesture.
+    if (!m_swipeStepped && std::abs(m_swipeDY) > std::abs(m_swipeDX) &&
+        std::abs(m_swipeDY) >= std::max(20.0, static_cast<double>(cfgInt("plugin:gloview:swipe_close_distance", 120))))
+        close();
+    m_swipeDX = m_swipeDY = 0.0;
+    m_swipeStepped        = false;
+    return true; // swallow
 }
 
 void Overview::onMouseMove() {
