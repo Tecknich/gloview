@@ -1662,8 +1662,22 @@ bool Overview::onMouseAxis(const IPointer::SAxisEvent& e) {
     }
 
     if (!overStrip && cfgInt("plugin:gloview:scroll_switches_workspace", 1) != 0) {
-        if (notches != 0.0)
-            stepWorkspace(notches > 0 ? 1 : -1);
+        // Step per ACCUMULATED notch, not per event. A discrete wheel notch is +/-1.0 so it
+        // still steps once per click, but a high-res touchpad emits a stream of fractional-
+        // delta events per swipe -- stepping on every nonzero one blew through dozens of
+        // workspaces at once. Accumulate and step only when a whole notch is crossed;
+        // scroll_workspace_sensitivity scales how far a touchpad swipe must travel.
+        if (notches * m_wsScrollAccum < 0.0)
+            m_wsScrollAccum = 0.0; // direction reversed -> drop the stale partial, switch crisply
+        m_wsScrollAccum += notches * std::max(0.05F, cfgFloat("plugin:gloview:scroll_workspace_sensitivity", 1.0F));
+        while (m_wsScrollAccum >= 1.0) {
+            stepWorkspace(1);
+            m_wsScrollAccum -= 1.0;
+        }
+        while (m_wsScrollAccum <= -1.0) {
+            stepWorkspace(-1);
+            m_wsScrollAccum += 1.0;
+        }
         return true;
     }
 
@@ -1878,7 +1892,20 @@ bool Overview::onMouseButton(const IPointer::SButtonEvent& e) {
             damage(); // dropped in empty space → tile snaps back to its slot
             return true;
         }
-        // a plain click → focus that window and dismiss
+        // A plain click focuses that window and dismisses. In the expo (all-workspaces)
+        // view the clicked window may live on a different workspace than the displayed one;
+        // fullWindowFocus never changes the active workspace, and deactivate() would commit
+        // the DISPLAYED workspace -- so without this the compositor lands on the wrong
+        // desktop with focus on a window it isn't showing. Switch to the window's workspace
+        // up front (mirrors the number-key path) and keep m_workspace in sync so deactivate()
+        // doesn't switch back.
+        if (w) {
+            if (const auto ws = w->m_workspace; ws && ws != m->m_activeWorkspace) {
+                m->changeWorkspace(ws, false, true, false);
+                m_workspace    = ws;
+                m_liveWsAtOpen = m->m_activeWorkspace;
+            }
+        }
         close();
         if (w)
             Desktop::focusState()->fullWindowFocus(w, Desktop::FOCUS_REASON_CLICK);
@@ -2585,6 +2612,7 @@ void Overview::deactivate() {
     m_strip.clear();
     m_hovered = m_hoveredStrip = -1;
     m_selected = -1;
+    m_wsScrollAccum = 0.0;
     m_recaptureLeft = 0;
     if (m_recaptureTimer)
         m_recaptureTimer->cancel();
