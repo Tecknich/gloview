@@ -1728,7 +1728,7 @@ bool Overview::onSwipeUpdate(const IPointer::SSwipeUpdateEvent& e) {
         const auto now = std::chrono::steady_clock::now();
         if (std::chrono::duration_cast<std::chrono::milliseconds>(now - m_lastWsScroll).count() >=
             std::max(0, cfgInt("plugin:gloview:scroll_workspace_cooldown", 130))) {
-            stepWorkspace(m_swipeDX > 0 ? 1 : -1); // reversed per request
+            stepWorkspace(m_swipeDX > 0 ? -1 : 1); // horizontal swipe -> workspace direction
             m_lastWsScroll = now;
             m_swipeStepped = true;
         }
