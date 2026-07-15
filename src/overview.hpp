@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -44,7 +45,55 @@ struct ConfigRegistry {
 };
 inline ConfigRegistry g_config;
 
-// macOS Mission Control-style overview for Hyprland.
+class Overview;
+
+// Owns everything global-and-once (the shouldRenderWindow hooks, the event-bus
+// listeners) and one Overview per monitor. toggle/open/close act on EVERY monitor
+// at once (Mission Control-style); pointer/keyboard events route to the monitor
+// under the cursor, render stages self-route (each view checks the pass monitor).
+class Manager {
+  public:
+    explicit Manager(HANDLE handle);
+    ~Manager();
+
+    bool initialize(); // install hooks + listeners; false aborts the plugin load
+
+    void toggle();              // any monitor open → close all, else open all
+    void open();                // open on every enabled monitor
+    void close();               // animate every open view closed (dead-monitor views hard-close)
+    void hardClose();           // synchronous all-view teardown for the UNLOAD path
+    void toggleDesktop();       // forward to every open view (no-op while closed)
+    void toggleAllWorkspaces(); // open all into expo, or flip expo on every open view
+
+    // render-hook predicates: true if ANY view says so (each view is monitor-scoped)
+    bool shouldHideWindow(const PHLWINDOW& w, const PHLMONITOR& m) const;
+    bool forceRenderWindow(const PHLWINDOW& w) const;
+
+  private:
+    bool      anyOpen() const;   // some view is up and not closing
+    bool      anyActive() const; // some view is up (including the close animation)
+    Overview* viewFor(const PHLMONITOR& m) const;
+    Overview* ensureView(const PHLMONITOR& m); // find-or-create (persistent per monitor: keeps m_snapGeom warm)
+    Overview* routeView() const;               // input target: view under the cursor, else first active
+    void      prune();                         // drop views whose monitor was disconnected
+
+    HANDLE                                 m_handle = nullptr;
+    std::vector<std::unique_ptr<Overview>> m_views;
+
+    CHyprSignalListener m_renderStageL;
+    CHyprSignalListener m_mouseButtonL;
+    CHyprSignalListener m_mouseAxisL;
+    CHyprSignalListener m_mouseMoveL;
+    CHyprSignalListener m_keyL;
+    CHyprSignalListener m_swipeBeginL;
+    CHyprSignalListener m_swipeUpdateL;
+    CHyprSignalListener m_swipeEndL;
+    CFunctionHook*      m_shouldRenderHook       = nullptr;
+    CFunctionHook*      m_shouldRenderWindowHook = nullptr;
+};
+
+// macOS Mission Control-style overview for ONE monitor (Manager holds one per
+// monitor and owns all global wiring).
 //
 //   ┌───────────────────────────────────────────────┐
 //   │  [ws1] [ws2] [ws3] ...                    [ + ] │  translucent strip
@@ -59,12 +108,9 @@ inline ConfigRegistry g_config;
 // layout.hpp so it can be tweaked independently.
 class Overview {
   public:
-    explicit Overview(HANDLE handle);
+    Overview(HANDLE handle, PHLMONITOR monitor);
     ~Overview();
 
-    bool initialize();
-
-    void toggle();
     void open();
     void close();
     void hardClose(); // immediate, animation-free teardown for the UNLOAD path (hyprctl gloviewunload)
@@ -100,6 +146,7 @@ class Overview {
     bool forceRenderWindow(const PHLWINDOW& w) const;
 
     [[nodiscard]] bool       active() const { return m_active; }
+    [[nodiscard]] bool       isOpen() const { return m_active && m_opening; } // up and not closing
     [[nodiscard]] PHLMONITOR monitor() const { return m_monitor.lock(); }
     [[nodiscard]] bool       blurEnabled() const; // plugin:gloview:blur != 0 (queried by the pass)
 
@@ -207,17 +254,6 @@ class Overview {
     double m_grabDX = 0, m_grabDY = 0;// cursor offset inside the tile at grab
     double m_dragX  = 0, m_dragY  = 0;// current monitor-local cursor
 
-    CHyprSignalListener m_renderStageL;
-    CHyprSignalListener m_mouseButtonL;
-    CHyprSignalListener m_mouseAxisL;
-    CHyprSignalListener m_mouseMoveL;
-    CHyprSignalListener m_keyL;
-    CHyprSignalListener m_swipeBeginL;
-    CHyprSignalListener m_swipeUpdateL;
-    CHyprSignalListener m_swipeEndL;
-    CFunctionHook*      m_shouldRenderHook = nullptr;
-    CFunctionHook*      m_shouldRenderWindowHook = nullptr; // one-arg shouldRenderWindow, used by makeSnapshot()
-
     // config helpers
     int           cfgInt(const char* name, int fallback) const;
     float         cfgFloat(const char* name, float fallback) const;
@@ -280,4 +316,4 @@ class Overview {
 
 } // namespace gloview
 
-inline gloview::Overview* g_overview = nullptr;
+inline gloview::Manager* g_manager = nullptr;

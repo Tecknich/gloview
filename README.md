@@ -51,6 +51,11 @@ Dispatchers: `gloview:toggle`, `gloview:open`, `gloview:close`, `gloview:desktop
 `gloview:allworkspaces` (the all-workspaces "expo" view — opens into it if closed)
 Or `hyprctl gloview` / `gloviewclose` / `gloviewdesktop` / `gloviewall`
 
+Multi-monitor: the overview opens on **every** monitor at once, each showing its own
+workspaces/windows. Pointer and keyboard input act on the monitor under the cursor;
+any dismiss (Esc, activating a window, clicking empty space, swipe-close) closes all
+monitors together, Mission Control-style.
+
 Lua:
 
 ```lua

@@ -191,19 +191,19 @@ PSHOULDRENDER       g_shouldRenderOrig       = nullptr;
 PSHOULDRENDERWINDOW g_shouldRenderWindowOrig = nullptr;
 
 bool hkShouldRenderWindow(void* thisptr, PHLWINDOW window, PHLMONITOR monitor) {
-    if (g_overview) {
+    if (g_manager) {
         // force-render the snapshotting window (may be on an inactive workspace, which
         // Hyprland's original rejects → blank/grey preview).
-        if (g_overview->forceRenderWindow(window))
+        if (g_manager->forceRenderWindow(window))
             return true;
-        if (g_overview->shouldHideWindow(window, monitor))
+        if (g_manager->shouldHideWindow(window, monitor))
             return false;
     }
     return g_shouldRenderOrig ? g_shouldRenderOrig(thisptr, window, monitor) : true;
 }
 
 bool hkShouldRenderWindowAny(void* thisptr, PHLWINDOW window) {
-    if (g_overview && g_overview->forceRenderWindow(window))
+    if (g_manager && g_manager->forceRenderWindow(window))
         return true;
     return g_shouldRenderWindowOrig ? g_shouldRenderWindowOrig(thisptr, window) : true;
 }
@@ -272,10 +272,10 @@ class COverlayPass final : public IPassElement {
 
 } // namespace
 
-Overview::Overview(HANDLE handle) : m_handle(handle) {}
+Overview::Overview(HANDLE handle, PHLMONITOR monitor) : m_handle(handle), m_monitor(monitor) {}
 
 Overview::~Overview() {
-    // stop rendering before state/hooks tear down, so any in-flight frame sees an
+    // stop rendering before state tears down, so any in-flight frame sees an
     // inactive overview and no dangling refs.
     m_active  = false;
     m_opening = false;
@@ -291,6 +291,19 @@ Overview::~Overview() {
         g_pEventLoopManager->removeTimer(m_recaptureTimer);
         m_recaptureTimer.reset();
     }
+}
+
+// ---- manager ------------------------------------------------------------------
+// One Overview per monitor; the Manager owns everything that can only exist once
+// (function hooks, event-bus listeners) and fans events out. Views persist across
+// open/close (keyed by monitor) so per-window snapshot state stays warm.
+
+Manager::Manager(HANDLE handle) : m_handle(handle) {}
+
+Manager::~Manager() {
+    // views first: their teardown (restoreLayers/restoreFill/timers) must run while
+    // the world is still intact; only then drop the hooks.
+    m_views.clear();
     if (m_shouldRenderHook) {
         HyprlandAPI::removeFunctionHook(m_handle, m_shouldRenderHook);
         m_shouldRenderHook = nullptr;
@@ -303,38 +316,106 @@ Overview::~Overview() {
     g_shouldRenderWindowOrig = nullptr;
 }
 
-bool Overview::initialize() {
+bool Manager::anyOpen() const {
+    return std::any_of(m_views.begin(), m_views.end(), [](const auto& v) { return v->isOpen(); });
+}
+
+bool Manager::anyActive() const {
+    return std::any_of(m_views.begin(), m_views.end(), [](const auto& v) { return v->active(); });
+}
+
+Overview* Manager::viewFor(const PHLMONITOR& m) const {
+    if (!m)
+        return nullptr;
+    for (const auto& v : m_views)
+        if (v->monitor() == m)
+            return v.get();
+    return nullptr;
+}
+
+Overview* Manager::ensureView(const PHLMONITOR& m) {
+    if (auto* v = viewFor(m))
+        return v;
+    m_views.push_back(std::make_unique<Overview>(m_handle, m));
+    return m_views.back().get();
+}
+
+// Input target: the view on the monitor under the cursor; when that monitor has no
+// active view (it declined to open, or was hot-plugged), fall back to any active one
+// so ESC/close always has somewhere to land.
+Overview* Manager::routeView() const {
+    if (auto* v = viewFor(g_pCompositor ? g_pCompositor->getMonitorFromCursor() : nullptr); v && v->active())
+        return v;
+    for (const auto& v : m_views)
+        if (v->active())
+            return v.get();
+    return nullptr;
+}
+
+void Manager::prune() {
+    std::erase_if(m_views, [](const auto& v) { return !v->monitor(); });
+}
+
+bool Manager::initialize() {
     auto& events = Event::bus()->m_events;
 
-    m_renderStageL = events.render.stage.listen([this](eRenderStage stage) { renderStage(stage); });
+    // Render stages self-route: every view checks the pass monitor against its own.
+    m_renderStageL = events.render.stage.listen([this](eRenderStage stage) {
+        for (const auto& v : m_views)
+            v->renderStage(stage);
+    });
+    // Pointer events go to the view under the cursor. While ANY view is up the overview
+    // is modal, so events landing on a monitor without an active view are swallowed
+    // (and a click there dismisses, like a click on empty space).
     m_mouseButtonL = events.input.mouse.button.listen([this](const IPointer::SButtonEvent& event, Event::SCallbackInfo& info) {
+        if (!anyActive())
+            return;
         const auto copied = event;
-        if (onMouseButton(copied))
-            info.cancelled = true;
+        if (auto* v = viewFor(g_pCompositor->getMonitorFromCursor()); v && v->active()) {
+            if (v->onMouseButton(copied))
+                info.cancelled = true;
+            return;
+        }
+        if (event.state == WL_POINTER_BUTTON_STATE_PRESSED)
+            close();
+        info.cancelled = true;
     });
     m_mouseAxisL = events.input.mouse.axis.listen([this](const IPointer::SAxisEvent& event, Event::SCallbackInfo& info) {
-        if (onMouseAxis(event))
-            info.cancelled = true;
+        if (!anyActive())
+            return;
+        if (auto* v = viewFor(g_pCompositor->getMonitorFromCursor()); v && v->active()) {
+            if (v->onMouseAxis(event))
+                info.cancelled = true;
+            return;
+        }
+        info.cancelled = true; // modal: never scroll a window behind the overview
     });
-    m_mouseMoveL = events.input.mouse.move.listen([this](const Vector2D&, Event::SCallbackInfo&) { onMouseMove(); });
-    m_keyL       = events.input.keyboard.key.listen([this](const IKeyboard::SKeyEvent& event, Event::SCallbackInfo& info) {
-        bool cancel = false;
-        onKey(event, cancel);
-        if (cancel)
-            info.cancelled = true;
+    // Hover tracking fans out to every view: the cursor can only be inside one
+    // monitor, and the others use the same pass to clear their stale hover state.
+    m_mouseMoveL = events.input.mouse.move.listen([this](const Vector2D&, Event::SCallbackInfo&) {
+        for (const auto& v : m_views)
+            v->onMouseMove();
+    });
+    m_keyL = events.input.keyboard.key.listen([this](const IKeyboard::SKeyEvent& event, Event::SCallbackInfo& info) {
+        if (auto* v = routeView()) {
+            bool cancel = false;
+            v->onKey(event, cancel);
+            if (cancel)
+                info.cancelled = true;
+        }
     });
     // 3-finger swipes: owned while the overview is open (horizontal steps workspaces, vertical
     // closes) and cancelled so Hyprland's native swipe gestures (workspace switch) don't fire behind.
     m_swipeBeginL  = events.gesture.swipe.begin.listen([this](const IPointer::SSwipeBeginEvent& event, Event::SCallbackInfo& info) {
-        if (onSwipeBegin(event))
+        if (auto* v = routeView(); v && v->onSwipeBegin(event))
             info.cancelled = true;
     });
     m_swipeUpdateL = events.gesture.swipe.update.listen([this](const IPointer::SSwipeUpdateEvent& event, Event::SCallbackInfo& info) {
-        if (onSwipeUpdate(event))
+        if (auto* v = routeView(); v && v->onSwipeUpdate(event))
             info.cancelled = true;
     });
     m_swipeEndL    = events.gesture.swipe.end.listen([this](const IPointer::SSwipeEndEvent&, Event::SCallbackInfo& info) {
-        if (onSwipeEnd())
+        if (auto* v = routeView(); v && v->onSwipeEnd())
             info.cancelled = true;
     });
 
@@ -381,6 +462,79 @@ bool Overview::initialize() {
     }
     g_shouldRenderWindowOrig = reinterpret_cast<PSHOULDRENDERWINDOW>(m_shouldRenderWindowHook->m_original);
     return true;
+}
+
+void Manager::toggle() {
+    if (anyOpen())
+        close();
+    else
+        open();
+}
+
+void Manager::open() {
+    prune();
+    if (!g_pCompositor)
+        return;
+    for (const auto& m : g_pCompositor->m_monitors) {
+        if (!m || !m->m_enabled || m->isMirror() || !m->m_activeWorkspace)
+            continue;
+        ensureView(m)->open();
+    }
+}
+
+void Manager::close() {
+    for (const auto& v : m_views) {
+        if (!v->active())
+            continue;
+        // A view whose monitor was disconnected can never finish its close animation
+        // (its render stage never runs again) — it would stay active and keep the
+        // input modality latched. Tear it down synchronously instead.
+        if (!v->monitor())
+            v->hardClose();
+        else
+            v->close();
+    }
+}
+
+void Manager::hardClose() {
+    for (const auto& v : m_views)
+        v->hardClose();
+}
+
+void Manager::toggleDesktop() {
+    for (const auto& v : m_views)
+        v->toggleDesktop(); // per-view no-op while closed, same as before
+}
+
+void Manager::toggleAllWorkspaces() {
+    // Closed → open every monitor straight into the expo view; open → flip expo on
+    // each view (per-view toggleAllWorkspaces handles both states).
+    if (!anyOpen()) {
+        prune();
+        if (!g_pCompositor)
+            return;
+        for (const auto& m : g_pCompositor->m_monitors) {
+            if (!m || !m->m_enabled || m->isMirror() || !m->m_activeWorkspace)
+                continue;
+            ensureView(m);
+        }
+    }
+    for (const auto& v : m_views)
+        v->toggleAllWorkspaces();
+}
+
+bool Manager::shouldHideWindow(const PHLWINDOW& w, const PHLMONITOR& m) const {
+    for (const auto& v : m_views)
+        if (v->shouldHideWindow(w, m))
+            return true;
+    return false;
+}
+
+bool Manager::forceRenderWindow(const PHLWINDOW& w) const {
+    for (const auto& v : m_views)
+        if (v->forceRenderWindow(w))
+            return true;
+    return false;
 }
 
 // ---- config -----------------------------------------------------------------
@@ -485,13 +639,6 @@ float Overview::blurStrength() const {
 
 // ---- open / close -----------------------------------------------------------
 
-void Overview::toggle() {
-    if (m_active && m_opening)
-        close();
-    else
-        open(); // opens into the tidy grid; Shift / gloview:desktop flips to the canvas
-}
-
 // gloview:allworkspaces — toggle the "expo" view (every window on the monitor). OPENS the
 // overview if closed (so it works as a single-key bind); while open flips expo on/off and
 // glides tiles. m_allOverride overrides show_all_workspaces until close (deactivate → -1).
@@ -543,11 +690,10 @@ void Overview::open() {
     if (m_active && m_opening)
         return;
 
-    const auto m = g_pCompositor->getMonitorFromCursor();
+    const auto m = m_monitor.lock(); // fixed at construction; Manager holds one view per monitor
     if (!m || !m->m_activeWorkspace)
         return;
 
-    m_monitor      = m;
     m_workspace    = m->m_activeWorkspace;
     m_liveWsAtOpen = m->m_activeWorkspace; // exit_on_switch watches this for external changes
     m_hovered = m_hoveredStrip = -1;
@@ -1196,7 +1342,7 @@ void Overview::renderStage(eRenderStage stage) {
     // DISPLAYED workspace, so this fires only on genuine external switches.
     if (m_opening && cfgInt("plugin:gloview:exit_on_switch", 0) != 0 && m->m_activeWorkspace != m_liveWsAtOpen.lock()) {
         m_workspace = m->m_activeWorkspace; // accept the external switch so deactivate() doesn't revert it
-        close();
+        g_manager->close();                 // a dismiss dismisses EVERY monitor's overview
     }
 
     // Layer order: backdrop + main tile chrome → main surfaces → strip chrome → strip
@@ -1743,7 +1889,7 @@ bool Overview::onSwipeEnd() {
     // 3-finger vertical open gesture.
     if (!m_swipeStepped && std::abs(m_swipeDY) > std::abs(m_swipeDX) &&
         std::abs(m_swipeDY) >= std::max(20.0, static_cast<double>(cfgInt("plugin:gloview:swipe_close_distance", 120))))
-        close();
+        g_manager->close(); // swipe-close dismisses every monitor's overview
     m_swipeDX = m_swipeDY = 0.0;
     m_swipeStepped        = false;
     return true; // swallow
@@ -1830,7 +1976,7 @@ bool Overview::onMouseButton(const IPointer::SButtonEvent& e) {
     const auto m = m_monitor.lock();
     if (!m) {
         if (e.state == WL_POINTER_BUTTON_STATE_PRESSED)
-            close();
+            g_manager->close();
         return true;
     }
     const auto   mc = g_pInputManager->getMouseCoordsInternal();
@@ -1964,14 +2110,14 @@ bool Overview::onMouseButton(const IPointer::SButtonEvent& e) {
                 m_liveWsAtOpen = m->m_activeWorkspace;
             }
         }
-        close();
+        g_manager->close(); // activating a window dismisses every monitor's overview
         if (w)
             Desktop::focusState()->fullWindowFocus(w, Desktop::FOCUS_REASON_CLICK);
         return true;
     }
 
     if (cfgInt("plugin:gloview:exit_on_click", 1) != 0)
-        close(); // released on empty space
+        g_manager->close(); // released on empty space — dismiss everywhere
     return true;
 }
 
@@ -2166,7 +2312,7 @@ void Overview::onKey(const IKeyboard::SKeyEvent& e, bool& cancel) {
     mods &= ~modBitForKeycode(k);
     bool handled = true;
     if (keyMatches(k, mods, "plugin:gloview:key_close", "escape"))
-        close();
+        g_manager->close(); // ESC dismisses every monitor's overview
     else if (keyMatches(k, mods, "plugin:gloview:key_next_workspace", "tab"))
         stepWorkspace(1); // cycle the displayed workspace card (wraps; committed on close)
     else if (keyMatches(k, mods, "plugin:gloview:key_prev_workspace", "shift+tab"))
@@ -2379,7 +2525,7 @@ void Overview::activateSelection() {
     PHLWINDOW w;
     if (m_selected >= 0 && m_selected < static_cast<int>(m_tiles.size()))
         w = m_tiles[m_selected].win.lock();
-    close();
+    g_manager->close(); // activating a window dismisses every monitor's overview
     if (w)
         Desktop::focusState()->fullWindowFocus(w, Desktop::FOCUS_REASON_KEYBIND);
 }

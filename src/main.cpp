@@ -17,7 +17,7 @@ extern "C" {
 #include "overview.hpp"
 
 inline HANDLE                         g_handle = nullptr;
-inline std::unique_ptr<gloview::Overview> g_overviewOwned;
+inline std::unique_ptr<gloview::Manager> g_managerOwned;
 
 namespace {
 // Keep the SP so cfg* can read the resolved value() — see ConfigRegistry in overview.hpp.
@@ -43,54 +43,54 @@ void addStr(const char* name, Config::STRING fallback) {
 }
 
 SDispatchResult dispToggle(std::string) {
-    if (g_overview)
-        g_overview->toggle();
+    if (g_manager)
+        g_manager->toggle();
     return {.success = true};
 }
 SDispatchResult dispOpen(std::string) {
-    if (g_overview)
-        g_overview->open();
+    if (g_manager)
+        g_manager->open();
     return {.success = true};
 }
 SDispatchResult dispClose(std::string) {
-    if (g_overview)
-        g_overview->close();
+    if (g_manager)
+        g_manager->close();
     return {.success = true};
 }
 SDispatchResult dispDesktop(std::string) {
-    if (g_overview)
-        g_overview->toggleDesktop();
+    if (g_manager)
+        g_manager->toggleDesktop();
     return {.success = true};
 }
 SDispatchResult dispAllWorkspaces(std::string) {
-    if (g_overview)
-        g_overview->toggleAllWorkspaces();
+    if (g_manager)
+        g_manager->toggleAllWorkspaces();
     return {.success = true};
 }
 
 int luaToggle(lua_State*) {
-    if (g_overview)
-        g_overview->toggle();
+    if (g_manager)
+        g_manager->toggle();
     return 0;
 }
 int luaOpen(lua_State*) {
-    if (g_overview)
-        g_overview->open();
+    if (g_manager)
+        g_manager->open();
     return 0;
 }
 int luaClose(lua_State*) {
-    if (g_overview)
-        g_overview->close();
+    if (g_manager)
+        g_manager->close();
     return 0;
 }
 int luaDesktop(lua_State*) {
-    if (g_overview)
-        g_overview->toggleDesktop();
+    if (g_manager)
+        g_manager->toggleDesktop();
     return 0;
 }
 int luaAllWorkspaces(lua_State*) {
-    if (g_overview)
-        g_overview->toggleAllWorkspaces();
+    if (g_manager)
+        g_manager->toggleAllWorkspaces();
     return 0;
 }
 } // namespace
@@ -177,12 +177,12 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     addInt("plugin:gloview:hide_overlay_layers", Config::INTEGER{0}); // fade out Overlay layer surfaces (popups/notifications)
     addStr("plugin:gloview:above_namespaces", "");                    // comma/space list of layer namespaces to draw ABOVE the overview (supports trailing '*' glob); namespaces containing "aboveoverview" are always treated this way
 
-    g_overviewOwned = std::make_unique<gloview::Overview>(handle);
-    g_overview      = g_overviewOwned.get();
-    if (!g_overview->initialize()) {
+    g_managerOwned = std::make_unique<gloview::Manager>(handle);
+    g_manager      = g_managerOwned.get();
+    if (!g_manager->initialize()) {
         HyprlandAPI::addNotification(handle, "[gloview] initialization failed", CHyprColor(1.0, 0.2, 0.2, 1.0), 6000);
-        g_overview = nullptr;
-        g_overviewOwned.reset();
+        g_manager = nullptr;
+        g_managerOwned.reset();
         // Throw so Hyprland ejects the plugin (it catches this and runs unloadPlugin).
         // Returning normally instead kept a half-alive instance loaded — dispatchers and
         // config registered but no render hooks — which then blocked every later load
@@ -201,8 +201,8 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                                     .name  = "gloview",
                                                     .exact = true,
                                                     .fn    = [](eHyprCtlOutputFormat, std::string) -> std::string {
-                                                        if (g_overview)
-                                                            g_overview->toggle();
+                                                        if (g_manager)
+                                                            g_manager->toggle();
                                                         return "ok\n";
                                                     },
                                                 });
@@ -214,8 +214,8 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                                     .name  = "gloviewclose",
                                                     .exact = true,
                                                     .fn    = [](eHyprCtlOutputFormat, std::string) -> std::string {
-                                                        if (g_overview)
-                                                            g_overview->close();
+                                                        if (g_manager)
+                                                            g_manager->close();
                                                         return "ok\n";
                                                     },
                                                 });
@@ -229,8 +229,8 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                                     .name  = "gloviewunload",
                                                     .exact = true,
                                                     .fn    = [](eHyprCtlOutputFormat, std::string) -> std::string {
-                                                        if (g_overview)
-                                                            g_overview->hardClose();
+                                                        if (g_manager)
+                                                            g_manager->hardClose();
                                                         return "ok\n";
                                                     },
                                                 });
@@ -240,8 +240,8 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                                     .name  = "gloviewdesktop",
                                                     .exact = true,
                                                     .fn    = [](eHyprCtlOutputFormat, std::string) -> std::string {
-                                                        if (g_overview)
-                                                            g_overview->toggleDesktop();
+                                                        if (g_manager)
+                                                            g_manager->toggleDesktop();
                                                         return "ok\n";
                                                     },
                                                 });
@@ -251,8 +251,8 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                                     .name  = "gloviewall",
                                                     .exact = true,
                                                     .fn    = [](eHyprCtlOutputFormat, std::string) -> std::string {
-                                                        if (g_overview)
-                                                            g_overview->toggleAllWorkspaces();
+                                                        if (g_manager)
+                                                            g_manager->toggleAllWorkspaces();
                                                         return "ok\n";
                                                     },
                                                 });
@@ -279,6 +279,6 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
-    g_overview = nullptr;
-    g_overviewOwned.reset();
+    g_manager = nullptr;
+    g_managerOwned.reset();
 }
