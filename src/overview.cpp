@@ -223,7 +223,9 @@ CHyprColor argb(Hyprlang::INT raw, double alphaMul = 1.0) {
 class COverlayPass final : public IPassElement {
   public:
     enum class Phase { Back, Mid, DragBack, Front };
-    COverlayPass(Overview* o, Phase phase) : m_owner(o), m_phase(phase) {}
+    // `mon` overrides the boundingBox monitor: a DragBack pass can be queued on a
+    // DIFFERENT monitor than its owner's (cross-monitor drag).
+    COverlayPass(Overview* o, Phase phase, PHLMONITOR mon = nullptr) : m_owner(o), m_phase(phase), m_mon(mon) {}
 
     std::vector<UP<IPassElement>> draw() override {
         if (!m_owner)
@@ -259,15 +261,18 @@ class COverlayPass final : public IPassElement {
     const char*         passName() override { return "GloviewOverlayPass"; }
     ePassElementType    type() override { return EK_CUSTOM; }
     std::optional<CBox> boundingBox() override {
-        const auto m = m_owner ? m_owner->monitor() : nullptr;
+        auto m = m_mon.lock();
+        if (!m && m_owner)
+            m = m_owner->monitor();
         if (!m)
             return std::nullopt;
         return CBox{{}, m->m_size};
     }
 
   private:
-    Overview*   m_owner = nullptr;
-    Phase       m_phase = Phase::Back;
+    Overview*     m_owner = nullptr;
+    Phase         m_phase = Phase::Back;
+    PHLMONITORREF m_mon; // render monitor override (cross-monitor drag); empty = owner's
 };
 
 } // namespace
@@ -340,6 +345,23 @@ Overview* Manager::ensureView(const PHLMONITOR& m) {
     return m_views.back().get();
 }
 
+Overview* Manager::dragSource() const {
+    for (const auto& v : m_views)
+        if (v->active() && v->draggingActive())
+            return v.get();
+    return nullptr;
+}
+
+// The view holding an unreleased button press. Press/release pairs must land on the
+// SAME view even when the cursor crossed onto another monitor in between (a drag),
+// else the release would read as an empty-space click there and dismiss everything.
+Overview* Manager::pressView() const {
+    for (const auto& v : m_views)
+        if (v->active() && v->pressActive())
+            return v.get();
+    return nullptr;
+}
+
 // Input target: the view on the monitor under the cursor; when that monitor has no
 // active view (it declined to open, or was hot-plugged), fall back to any active one
 // so ESC/close always has somewhere to land.
@@ -371,6 +393,13 @@ bool Manager::initialize() {
         if (!anyActive())
             return;
         const auto copied = event;
+        // an unreleased press owns the button stream (cross-monitor drag lands its
+        // release on the view that armed the press, which handles the drop itself)
+        if (auto* v = pressView()) {
+            if (v->onMouseButton(copied))
+                info.cancelled = true;
+            return;
+        }
         if (auto* v = viewFor(g_pCompositor->getMonitorFromCursor()); v && v->active()) {
             if (v->onMouseButton(copied))
                 info.cancelled = true;
@@ -1353,10 +1382,17 @@ void Overview::renderStage(eRenderStage stage) {
     renderMainWindows();
     pass.add(makeUnique<COverlayPass>(this, COverlayPass::Phase::Mid));
     renderStripWindows();
-    const bool dragging = m_dragging && m_pressTile >= 0 && m_pressTile < static_cast<int>(m_tiles.size());
-    if (dragging) {
-        pass.add(makeUnique<COverlayPass>(this, COverlayPass::Phase::DragBack));
-        renderDragWindow();
+    // Drag overlay: drawn on EVERY monitor the dragged tile's box overlaps — its own
+    // and any neighbour the cursor carried it onto — so a tile crosses monitor edges
+    // seamlessly. The SOURCE view renders it; renderDragTile/renderDragWindow remap
+    // into the current render monitor's space and scale.
+    if (Overview* src = g_manager->dragSource()) {
+        const LRect gb = src->dragBoxGlobal();
+        if (gb.w > 0 && gb.x < m->m_position.x + m->m_size.x && gb.x + gb.w > m->m_position.x && //
+            gb.y < m->m_position.y + m->m_size.y && gb.y + gb.h > m->m_position.y) {
+            pass.add(makeUnique<COverlayPass>(src, COverlayPass::Phase::DragBack, m));
+            src->renderDragWindow();
+        }
     }
     pass.add(makeUnique<COverlayPass>(this, COverlayPass::Phase::Front));
 
@@ -1545,8 +1581,8 @@ LRect Overview::closeButtonRect(const LRect& lb) const {
     return LRect{cx - r, cy - r, 2 * r, 2 * r};
 }
 
-void Overview::drawPreviewTile(size_t i, const LRect& slot, bool lift) const {
-    const auto m = m_monitor.lock();
+void Overview::drawPreviewTile(size_t i, const LRect& slot, bool lift, PHLMONITOR onMon) const {
+    const auto m = onMon ? onMon : m_monitor.lock(); // foreign monitor mid-drag: its scale/size
     if (!m || i >= m_tiles.size())
         return;
     const double s         = m->m_scale; // logical→pixel; Hyprland's renderRect wants pixel coords
@@ -1685,28 +1721,51 @@ void Overview::renderMainWindows() const {
     }
 }
 
+// The dragged tile's box in GLOBAL logical coords, for cross-monitor overlap tests.
+LRect Overview::dragBoxGlobal() const {
+    const auto  m = m_monitor.lock();
+    const LRect b = dragBox();
+    if (!m || b.w <= 0)
+        return LRect{0, 0, 0, 0};
+    return LRect{b.x + m->m_position.x, b.y + m->m_position.y, b.w, b.h};
+}
+
+// Both drag renderers may run during ANOTHER monitor's pass (cross-monitor drag):
+// remap our monitor-local drag box into the CURRENT render monitor's space and use
+// ITS scale, so the tile draws correctly wherever the cursor carried it.
 void Overview::renderDragTile() const {
     const int dragIdx = (m_dragging && m_pressTile >= 0 && m_pressTile < static_cast<int>(m_tiles.size())) ? m_pressTile : -1;
     if (dragIdx < 0)
         return;
-    drawPreviewTile(static_cast<size_t>(dragIdx), dragBox(), true); // chrome; surface queued in renderDragWindow
+    const auto own = m_monitor.lock();
+    const auto rm  = g_pHyprRenderer->m_renderData.pMonitor.lock();
+    if (!own || !rm)
+        return;
+    LRect b = dragBox();
+    b.x += own->m_position.x - rm->m_position.x;
+    b.y += own->m_position.y - rm->m_position.y;
+    drawPreviewTile(static_cast<size_t>(dragIdx), b, true, rm); // chrome; surface queued in renderDragWindow
 }
 
 void Overview::renderDragWindow() const {
     const int dragIdx = (m_dragging && m_pressTile >= 0 && m_pressTile < static_cast<int>(m_tiles.size())) ? m_pressTile : -1;
     if (dragIdx < 0)
         return;
-    const auto m = m_monitor.lock();
-    if (!m)
+    const auto own = m_monitor.lock();
+    const auto rm  = g_pHyprRenderer->m_renderData.pMonitor.lock();
+    if (!own || !rm)
         return;
     const auto w = m_tiles[dragIdx].win.lock();
     if (!w || !w->m_isMapped || w->isHidden())
         return;
-    const double e     = eased();
-    const double scale = m->m_scale;
-    const LRect  lb    = tileContentBox(static_cast<size_t>(dragIdx), dragBox());
+    const double e = eased();
+    LRect        db = dragBox();
+    db.x += own->m_position.x - rm->m_position.x;
+    db.y += own->m_position.y - rm->m_position.y;
+    const double scale = rm->m_scale;
+    const LRect  lb    = tileContentBox(static_cast<size_t>(dragIdx), db);
     const CBox   px(lb.x * scale, lb.y * scale, lb.w * scale, lb.h * scale);
-    renderWindowLive(w, m, px, px, static_cast<float>(e), Time::steadyNow());
+    renderWindowLive(w, rm, px, px, static_cast<float>(e), Time::steadyNow());
 }
 
 bool Overview::isAboveLayer(const std::string& ns) const {
@@ -2060,6 +2119,15 @@ bool Overview::onMouseButton(const IPointer::SButtonEvent& e) {
         const auto w = m_tiles[press].win.lock();
         if (m_dragging) {
             m_dragging = false;
+            // Cross-monitor drop: the cursor ended on ANOTHER monitor → hand the window
+            // to that monitor's overview (its strip card under the cursor, else its
+            // displayed workspace). Our own tiles reflow via syncTiles once it leaves.
+            if (const auto curMon = g_pCompositor->getMonitorFromCursor(); curMon && curMon != m) {
+                if (auto* dst = g_manager->viewFor(curMon); dst && dst->isOpen() && w)
+                    dst->acceptCrossDrop(w, mc.x, mc.y);
+                damage(); // no target overview there → tile snaps back to its slot
+                return true;
+            }
             // dropped onto a workspace card → move the window there
             for (size_t i = 0; i < m_strip.size(); ++i) {
                 const LRect c = stripCardAt(i);
@@ -2119,6 +2187,32 @@ bool Overview::onMouseButton(const IPointer::SButtonEvent& e) {
     if (cfgInt("plugin:gloview:exit_on_click", 1) != 0)
         g_manager->close(); // released on empty space — dismiss everywhere
     return true;
+}
+
+// A drop arriving from ANOTHER monitor's overview (cross-monitor drag). Coords are
+// GLOBAL logical: pick the strip card under the cursor (including "+" → a fresh
+// workspace on THIS monitor), else fall back to the displayed workspace, and let
+// dropOnWorkspace do the actual move + reflow.
+void Overview::acceptCrossDrop(const PHLWINDOW& w, double gx, double gy) {
+    const auto m = m_monitor.lock();
+    if (!m || !w)
+        return;
+    const double lx = gx - m->m_position.x;
+    const double ly = gy - m->m_position.y;
+    for (size_t i = 0; i < m_strip.size(); ++i) {
+        if (m_strip[i].isAll) // not a workspace target; falls through to the displayed one
+            continue;
+        const LRect c = stripCardAt(i);
+        if (lx >= c.x && ly >= c.y && lx <= c.x + c.w && ly <= c.y + c.h) {
+            dropOnWorkspace(w, m_strip[i]);
+            return;
+        }
+    }
+    if (const auto ws = m_workspace.lock()) {
+        StripItem it;
+        it.ws = ws;
+        dropOnWorkspace(w, it);
+    }
 }
 
 void Overview::dropOnWorkspace(const PHLWINDOW& w, const StripItem& it) {

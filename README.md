@@ -54,7 +54,10 @@ Or `hyprctl gloview` / `gloviewclose` / `gloviewdesktop` / `gloviewall`
 Multi-monitor: the overview opens on **every** monitor at once, each showing its own
 workspaces/windows. Pointer and keyboard input act on the monitor under the cursor;
 any dismiss (Esc, activating a window, clicking empty space, swipe-close) closes all
-monitors together, Mission Control-style.
+monitors together, Mission Control-style. Window previews drag **across monitors**:
+drop one on another monitor's workspace card (or its "+" card for a fresh workspace)
+to move the window there, or anywhere in its main area to move it to that monitor's
+displayed workspace.
 
 Lua:
 

@@ -69,10 +69,13 @@ class Manager {
     bool shouldHideWindow(const PHLWINDOW& w, const PHLMONITOR& m) const;
     bool forceRenderWindow(const PHLWINDOW& w) const;
 
+    Overview* viewFor(const PHLMONITOR& m) const;
+    Overview* dragSource() const; // the view with a live tile drag, if any (cross-monitor drag)
+
   private:
     bool      anyOpen() const;   // some view is up and not closing
     bool      anyActive() const; // some view is up (including the close animation)
-    Overview* viewFor(const PHLMONITOR& m) const;
+    Overview* pressView() const; // the view owning an unreleased button press (keeps press/release pairs together)
     Overview* ensureView(const PHLMONITOR& m); // find-or-create (persistent per monitor: keeps m_snapGeom warm)
     Overview* routeView() const;               // input target: view under the cursor, else first active
     void      prune();                         // drop views whose monitor was disconnected
@@ -149,6 +152,13 @@ class Overview {
     [[nodiscard]] bool       isOpen() const { return m_active && m_opening; } // up and not closing
     [[nodiscard]] PHLMONITOR monitor() const { return m_monitor.lock(); }
     [[nodiscard]] bool       blurEnabled() const; // plugin:gloview:blur != 0 (queried by the pass)
+    // cross-monitor drag: -1 is PRESS_NONE; >= 0 is a tile drag candidate
+    [[nodiscard]] bool       pressActive() const { return m_pressTile != -1; }
+    [[nodiscard]] bool       draggingActive() const { return m_dragging && m_pressTile >= 0; }
+    [[nodiscard]] LRect      dragBoxGlobal() const; // dragged tile's box in GLOBAL logical coords (w<=0 when idle)
+    // a drop arriving from another monitor's overview: move `w` to the strip card under
+    // the (global) cursor, else to this monitor's displayed workspace
+    void acceptCrossDrop(const PHLWINDOW& w, double gx, double gy);
 
   private:
     struct Tile {
@@ -287,7 +297,9 @@ class Overview {
     LRect  currentBox(const Tile& t, int i) const; // lerped natural->target, staggered + overshoot
     LRect  tileContentBox(size_t i, const LRect& slot) const; // slot fitted to the window's aspect
     LRect  dragBox() const;                        // the picked-up tile's box at the cursor
-    void   drawPreviewTile(size_t i, const LRect& slot, bool lift) const; // tile chrome (shadow/border/backing/title)
+    // tile chrome (shadow/border/backing/title). onMon overrides the target monitor
+    // (scale + label clamping) when the tile is drawn on a foreign monitor mid-drag.
+    void   drawPreviewTile(size_t i, const LRect& slot, bool lift, PHLMONITOR onMon = nullptr) const;
     void   switchToWorkspace(const StripItem& it, int slideDir = 0);
     void   dropOnWorkspace(const PHLWINDOW& w, const StripItem& it);
     void   swapTiles(int a, int b);           // drag a preview onto another → swap the two windows' places (real layout + overview)
