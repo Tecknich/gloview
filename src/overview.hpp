@@ -129,6 +129,7 @@ class Overview {
     void renderMainWindows() const; // live window surfaces for the main-area tiles
     void renderDragTile() const;  // the picked-up tile's chrome, drawn over the strip
     void renderDragWindow() const; // the picked-up tile's live surface
+    void renderDragStripCard() const; // the picked-up workspace card's chrome, drawn over the strip
     void renderCursorOnTop() const; // redraw the SW cursor over our overlay
     bool isAboveLayer(const std::string& ns) const;
     void renderAboveLayers() const; // re-render opted-in TOP/OVERLAY layer surfaces on top of the overview
@@ -249,6 +250,7 @@ class Overview {
     bool                                  m_newCardAnim  = false;
     std::chrono::steady_clock::time_point m_newCardStart;
     PHLWORKSPACEREF                       m_newWs;            // freshly "+"-created ws, held persistent until close so it isn't reaped empty
+    std::vector<PHLWORKSPACEREF>          m_heldWs;           // workspaces pinned persistent during a reorder; released at deactivate()/hardClose()
     double                                m_stripScroll = 0.0;    // strip group scroll offset along its main axis
     double                                m_stripScrollMax = 0.0; // max scroll (0 when the cards fit the band)
     std::chrono::steady_clock::time_point m_lastWsScroll;         // last touchpad workspace-step time (cooldown throttle; default-ctor == epoch so the first scroll always fires)
@@ -264,6 +266,12 @@ class Overview {
     double m_grabDX = 0, m_grabDY = 0;// cursor offset inside the tile at grab
     double m_dragX  = 0, m_dragY  = 0;// current monitor-local cursor
 
+    // strip-card drag-to-reorder. A press lands on exactly one of {window tile, strip card},
+    // so these share m_pressX/Y, m_grabDX/DY and m_dragX/Y with the tile drag above.
+    int    m_pressStrip     = -1;    // m_strip index armed on press (real ws cards only), else -1
+    int    m_pressStripWsId = 0;     // dragged card's workspace id; survives a mid-drag buildStrip()
+    bool   m_stripDragging  = false; // the card drag passed the 8px threshold
+    int    m_stripDropIdx   = -1;    // insertion slot among real cards [0..nReal-1], -1 = outside band
     // config helpers
     int           cfgInt(const char* name, int fallback) const;
     float         cfgFloat(const char* name, float fallback) const;
@@ -297,6 +305,10 @@ class Overview {
     LRect  currentBox(const Tile& t, int i) const; // lerped natural->target, staggered + overshoot
     LRect  tileContentBox(size_t i, const LRect& slot) const; // slot fitted to the window's aspect
     LRect  dragBox() const;                        // the picked-up tile's box at the cursor
+    LRect  dragCardBox() const;                    // the picked-up workspace card following the cursor (full card size)
+    int    stripIndexOfWs(int wsId) const;         // m_strip index of the real card with this ws id, else -1
+    int    stripInsertIndexAt(double lx, double ly) const; // reorder insertion slot among real cards; -1 outside band
+    void   reorderWorkspaces(int insertSlot);      // move window contents so the dragged card takes slot `insertSlot`
     // tile chrome (shadow/border/backing/title). onMon overrides the target monitor
     // (scale + label clamping) when the tile is drawn on a foreign monitor mid-drag.
     void   drawPreviewTile(size_t i, const LRect& slot, bool lift, PHLMONITOR onMon = nullptr) const;

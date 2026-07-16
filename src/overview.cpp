@@ -236,7 +236,10 @@ class COverlayPass final : public IPassElement {
                 m_owner->renderPreviews(); // main tile chrome; surfaces queued right after
                 break;
             case Phase::Mid: m_owner->renderStrip(); break;          // strip chrome; surfaces queued after
-            case Phase::DragBack: m_owner->renderDragTile(); break;  // dragged tile chrome; surface queued after
+            case Phase::DragBack:                                    // dragged tile chrome (surface queued after) OR dragged workspace card
+                m_owner->renderDragTile();
+                m_owner->renderDragStripCard();
+                break;
             case Phase::Front: m_owner->renderCursorOnTop(); break;
         }
         return {};
@@ -737,6 +740,9 @@ void Overview::open() {
     m_pressTile = -1;
     m_dragging  = false;
     m_dragX = m_dragY = m_pressX = m_pressY = m_grabDX = m_grabDY = 0.0;
+    m_pressStrip    = -1;
+    m_stripDragging = false;
+    m_stripDropIdx  = -1;
     m_canvasPos.clear();
     m_desktopMode = false; // open into the tidy grid; Shift / gloview:desktop flips to the canvas
     m_newCardAnim = false;
@@ -819,6 +825,10 @@ void Overview::hardClose() {
     if (const auto ws = m_newWs.lock()) // don't leak a held-persistent "+"-created workspace
         ws->setPersistent(false);
     m_newWs.reset();
+    for (const auto& wref : m_heldWs) // nor a reorder-pinned workspace
+        if (const auto ws = wref.lock())
+            ws->setPersistent(false);
+    m_heldWs.clear();
 
     m_active            = false;
     m_opening           = false;
@@ -1394,6 +1404,12 @@ void Overview::renderStage(eRenderStage stage) {
             src->renderDragWindow();
         }
     }
+
+    // A workspace-card reorder drag stays within its own monitor's strip (no live surface,
+    // never crosses monitors): draw this view's ghost card over the strip. The insertion
+    // bar rides the Mid/renderStrip phase already queued above.
+    if (m_stripDragging && stripIndexOfWs(m_pressStripWsId) >= 0)
+        pass.add(makeUnique<COverlayPass>(this, COverlayPass::Phase::DragBack));
     pass.add(makeUnique<COverlayPass>(this, COverlayPass::Phase::Front));
 
     renderAboveLayers(); // opted-in layer surfaces (e.g. the live-input HUD) sit on top of the overview
@@ -1458,6 +1474,8 @@ void Overview::renderStrip() const {
 
     for (size_t i = 0; i < m_strip.size(); ++i) {
         const auto&  it     = m_strip[i];
+        if (m_stripDragging && !it.isAll && !it.isPlus && it.id == m_pressStripWsId)
+            continue; // picked-up card renders at the cursor (renderDragStripCard), not in its slot
         const bool   hover  = static_cast<int>(i) == m_hoveredStrip;
         LRect        card   = it.card;
         card.x += slide.x + scroll.x; // follow the strip slide-in and scroll
@@ -1531,6 +1549,40 @@ void Overview::renderStrip() const {
             const double ly        = card.y - labelBand + (labelBand - lh) / 2.0;
             const float  la        = it.active ? static_cast<float>(e) : static_cast<float>(e) * 0.75F;
             g_pHyprOpenGL->renderTexture(it.label, pxb(CBox(lx, ly, lw, lh), s), {.a = la});
+        }
+    }
+
+    // reorder insertion indicator: a bar in the gap where the dragged card would land
+    if (m_stripDragging && m_stripDropIdx >= 0) {
+        std::vector<LRect> reals;
+        for (size_t i = 0; i < m_strip.size(); ++i) {
+            const auto& it2 = m_strip[i];
+            if (it2.isAll || it2.isPlus || it2.id == m_pressStripWsId)
+                continue;
+            LRect c = it2.card;
+            c.x += slide.x + scroll.x;
+            c.y += slide.y + scroll.y;
+            reals.push_back(c);
+        }
+        if (!reals.empty()) {
+            const bool   horiz   = stripHorizontal();
+            const int    di      = std::clamp(m_stripDropIdx, 0, static_cast<int>(reals.size()));
+            const double halfGap = cfgInt("plugin:gloview:strip_gap", 18) / 2.0;
+            double       gapMain;
+            if (di == 0)
+                gapMain = (horiz ? reals.front().x : reals.front().y) - halfGap;
+            else if (di >= static_cast<int>(reals.size()))
+                gapMain = (horiz ? reals.back().x + reals.back().w : reals.back().y + reals.back().h) + halfGap;
+            else {
+                const LRect& a  = reals[di - 1];
+                const LRect& b2 = reals[di];
+                gapMain = horiz ? (a.x + a.w + b2.x) / 2.0 : (a.y + a.h + b2.y) / 2.0;
+            }
+            const double barW = 3.0;
+            const LRect& ref  = reals.front();
+            const CBox   bar  = horiz ? CBox(gapMain - barW / 2.0, ref.y, barW, ref.h)
+                                      : CBox(ref.x, gapMain - barW / 2.0, ref.w, barW);
+            g_pHyprOpenGL->renderRect(pxb(bar, s), activeLine, {.round = pxr(barW / 2.0, s)});
         }
     }
 }
@@ -1962,6 +2014,14 @@ void Overview::onMouseMove() {
         damage();
 }
 
+namespace {
+constexpr int PRESS_NONE     = -1;
+constexpr int PRESS_STRIP    = -2; // press landed on a real workspace card (drag/click decided on release)
+constexpr int PRESS_EMPTY    = -3; // press landed on empty space (close on release)
+constexpr int PRESS_CONSUMED = -4; // press fully handled (e.g. desktop ✕) — release must do nothing
+// BTN_MIDDLE (0x112) comes from linux/input-event-codes.h, pulled in transitively.
+} // namespace
+
 void Overview::updateHover() {
     if (!m_active)
         return;
@@ -1971,6 +2031,24 @@ void Overview::updateHover() {
     const auto   mc = g_pInputManager->getMouseCoordsInternal();
     const double lx = mc.x - m->m_position.x;
     const double ly = mc.y - m->m_position.y;
+
+    // strip-card drag: promote a pressed workspace card to a real drag past the same threshold,
+    // then follow the cursor and compute the insertion slot. m_pressTile == PRESS_STRIP here, so
+    // the tile-drag block below (guarded by m_pressTile >= 0) can never run concurrently.
+    if (m_pressTile == PRESS_STRIP && m_pressStrip >= 0) {
+        const double dx = lx - m_pressX;
+        const double dy = ly - m_pressY;
+        if (!m_stripDragging && (dx * dx + dy * dy) > 64.0) // ~8px, same as tiles
+            m_stripDragging = true;
+        if (m_stripDragging) {
+            m_dragX        = lx;
+            m_dragY        = ly;
+            m_stripDropIdx = stripInsertIndexAt(lx, ly);
+            m_hoveredStrip = -1; // the insertion bar is the only feedback while reordering
+            damage();
+            return;
+        }
+    }
 
     // drag tracking: promote a pressed tile to a real drag once the pointer passes a
     // small threshold, then follow the cursor.
@@ -2020,14 +2098,6 @@ void Overview::updateHover() {
     }
 }
 
-namespace {
-constexpr int PRESS_NONE  = -1;
-constexpr int PRESS_STRIP = -2; // press landed on a strip card (switch happened)
-constexpr int PRESS_EMPTY = -3; // press landed on empty space (close on release)
-constexpr int PRESS_CONSUMED = -4; // press fully handled (e.g. desktop ✕) — release must do nothing
-// BTN_MIDDLE (0x112) comes from linux/input-event-codes.h, pulled in transitively.
-} // namespace
-
 bool Overview::onMouseButton(const IPointer::SButtonEvent& e) {
     if (!m_active)
         return false;
@@ -2045,6 +2115,9 @@ bool Overview::onMouseButton(const IPointer::SButtonEvent& e) {
     if (e.state == WL_POINTER_BUTTON_STATE_PRESSED) {
         m_pressTile = PRESS_NONE;
         m_dragging  = false;
+        m_pressStrip    = -1;
+        m_stripDragging = false;
+        m_stripDropIdx  = -1;
 
         // middle-click a workspace card → close every window on it (handled fully on
         // press). Per-window close is keyboard-only now (key_close_window, see onKey).
@@ -2072,18 +2145,25 @@ bool Overview::onMouseButton(const IPointer::SButtonEvent& e) {
             }
         }
 
-        // strip card → switch the displayed workspace right away (no drag here); the
-        // "+" card creates a new workspace (addWorkspace handles follow + pop-in anim).
+        // strip card. isAll / "+" act on PRESS (fixed, never draggable). A real workspace card
+        // ARMS a drag candidate; click-vs-drag is decided on release (mirrors window tiles) so a
+        // drag doesn't fire an immediate switchToWorkspace that rebuilds the strip mid-drag.
         for (size_t i = 0; i < m_strip.size(); ++i) {
             const LRect c = stripCardAt(i);
             if (lx >= c.x && ly >= c.y && lx <= c.x + c.w && ly <= c.y + c.h) {
-                m_pressTile = PRESS_STRIP;
+                m_pressTile = PRESS_STRIP; // this alone suppresses every window-tile path below
                 if (m_strip[i].isAll)
                     toggleAllWorkspaces();
                 else if (m_strip[i].isPlus)
                     addWorkspace();
-                else
-                    switchToWorkspace(m_strip[i]);
+                else {
+                    m_pressStrip     = static_cast<int>(i);
+                    m_pressStripWsId = m_strip[i].id;
+                    m_pressX = m_dragX = lx;
+                    m_pressY = m_dragY = ly;
+                    m_grabDX = lx - c.x;
+                    m_grabDY = ly - c.y;
+                }
                 return true;
             }
         }
@@ -2112,8 +2192,27 @@ bool Overview::onMouseButton(const IPointer::SButtonEvent& e) {
     const int press = m_pressTile;
     m_pressTile     = PRESS_NONE;
 
-    if (press == PRESS_STRIP || press == PRESS_CONSUMED)
-        return true; // switch / ✕ already handled on press; ignore the release
+    if (press == PRESS_CONSUMED)
+        return true; // desktop ✕ already handled on press
+
+    if (press == PRESS_STRIP) {
+        if (m_stripDragging) {
+            // dropped a workspace card: reorder its window contents to the new slot (or cancel).
+            if (m_stripDropIdx >= 0)
+                reorderWorkspaces(m_stripDropIdx);
+            else
+                damage(); // released outside the band → ghost snaps back on the next frame
+        } else if (m_pressStrip >= 0) {
+            // plain click on a real card → switch on release (drag disambiguation; matches tiles)
+            const int i = stripIndexOfWs(m_pressStripWsId);
+            if (i >= 0)
+                switchToWorkspace(m_strip[i]);
+        }
+        m_pressStrip    = -1;
+        m_stripDragging = false;
+        m_stripDropIdx  = -1;
+        return true;
+    }
 
     if (press >= 0 && press < static_cast<int>(m_tiles.size())) {
         const auto w = m_tiles[press].win.lock();
@@ -2261,6 +2360,236 @@ void Overview::dropOnWorkspace(const PHLWINDOW& w, const StripItem& it) {
     // their new slots. replayReflow keeps the chrome settled (m_progress pinned at 1 —
     // no backdrop flash / strip re-slide); tiles render live, nothing to recapture.
     replayReflow(oldBoxes);
+    damage();
+}
+
+// ---- workspace card drag-to-reorder ----------------------------------------
+
+LRect Overview::dragCardBox() const {
+    const int   i    = stripIndexOfWs(m_pressStripWsId);
+    const LRect card = (i >= 0) ? m_strip[i].card : LRect{0, 0, 120, 72};
+    return LRect{m_dragX - m_grabDX, m_dragY - m_grabDY, card.w, card.h};
+}
+
+int Overview::stripIndexOfWs(int wsId) const {
+    if (wsId <= 0)
+        return -1;
+    for (size_t i = 0; i < m_strip.size(); ++i)
+        if (!m_strip[i].isAll && !m_strip[i].isPlus && m_strip[i].id == wsId)
+            return static_cast<int>(i);
+    return -1;
+}
+
+int Overview::stripInsertIndexAt(double lx, double ly) const {
+    const LRect  b    = stripBand();
+    const double slop = 40.0;
+    if (lx < b.x - slop || ly < b.y - slop || lx > b.x + b.w + slop || ly > b.y + b.h + slop)
+        return -1; // released outside the band → cancel
+    const bool   horiz = stripHorizontal();
+    const double p     = horiz ? lx : ly;
+    int          slot  = 0; // count surviving real cards whose center precedes the cursor
+    for (size_t i = 0; i < m_strip.size(); ++i) {
+        const auto& it = m_strip[i];
+        if (it.isAll || it.isPlus || it.id == m_pressStripWsId)
+            continue;
+        const LRect  c      = stripCardAt(i);
+        const double center = horiz ? (c.x + c.w / 2.0) : (c.y + c.h / 2.0);
+        if (center < p)
+            ++slot;
+    }
+    return slot;
+}
+
+// The dragged card's chrome at the cursor (DragBack phase). A schematic card: ring + body +
+// window-slot rects + label; no live surfaces (the real previews reappear on drop-rebuild).
+void Overview::renderDragStripCard() const {
+    if (!m_stripDragging)
+        return;
+    const int idx = stripIndexOfWs(m_pressStripWsId);
+    if (idx < 0)
+        return;
+    const auto m = m_monitor.lock();
+    if (!m)
+        return;
+    const double e          = eased();
+    const double s          = m->m_scale;
+    const LRect  card       = dragCardBox();
+    const CBox   c          = box(card);
+    const int    cardRound  = cfgInt("plugin:gloview:strip_card_round", 10);
+    const auto   activeBg   = argb(cfgColor("plugin:gloview:strip_active_color", 0x4d1c2c44), e);
+    const auto   activeLine = argb(cfgColor("plugin:gloview:strip_active_border", 0xf0ffffff), e);
+
+    const double t = 2.5;
+    g_pHyprOpenGL->renderRect(pxb(CBox(c.x - t, c.y - t, c.w + 2 * t, c.h + 2 * t), s), activeLine, {.round = pxr(cardRound + t, s)});
+    g_pHyprOpenGL->renderRect(pxb(c, s), activeBg, {.round = pxr(cardRound, s)});
+
+    const auto& it = m_strip[idx];
+    for (const auto& sw : it.wins) {
+        const auto w = sw.win.lock();
+        if (!w || !w->m_isMapped || w->isHidden())
+            continue;
+        const CBox wb(card.x + sw.rel.x * card.w + 1.0, card.y + sw.rel.y * card.h + 1.0,
+                      std::max(2.0, sw.rel.w * card.w - 2.0), std::max(2.0, sw.rel.h * card.h - 2.0));
+        g_pHyprOpenGL->renderRect(pxb(wb, s), argb(0xff2a3550, e), {.round = pxr(4, s)});
+    }
+    if (it.label && it.label->m_size.x > 0) {
+        double       lw = it.label->m_size.x, lh = it.label->m_size.y;
+        const double maxLw = card.w + 24.0;
+        if (lw > maxLw) {
+            const double sc = maxLw / lw;
+            lw *= sc;
+            lh *= sc;
+        }
+        const double labelBand = 26.0;
+        const double llx = card.cx() - lw / 2.0;
+        const double lly = card.y - labelBand + (labelBand - lh) / 2.0;
+        g_pHyprOpenGL->renderTexture(it.label, pxb(CBox(llx, lly, lw, lh), s), {.a = static_cast<float>(e)});
+    }
+}
+
+// Reorder: the dragged card (found by m_pressStripWsId) is inserted at real-slot `insertSlot`.
+// Workspace IDs are left FIXED -- mutating m_id is unsafe (no setter; collides with persistent-
+// workspace recreation; emits no IPC event, so id-keyed consumers desync). Instead the WINDOW
+// CONTENTS are rotated across the fixed numbered slots, so the id-sorted strip shows the new order
+// and $mod+N / hyprstatus / the number-row keys stay correct by construction. Custom workspace
+// names travel with their content.
+void Overview::reorderWorkspaces(int insertSlot) {
+    const auto m = m_monitor.lock();
+    if (!m) {
+        damage();
+        return;
+    }
+
+    // real-card ws ids in strip order (ascending by m_id); skip All / "+" / special / dead
+    std::vector<WORKSPACEID> ids;
+    int                      from = -1;
+    for (const auto& it : m_strip) {
+        if (it.isAll || it.isPlus || it.id <= 0 || !it.ws.lock())
+            continue;
+        if (it.id == m_pressStripWsId)
+            from = static_cast<int>(ids.size());
+        ids.push_back(it.id);
+    }
+    const int n  = static_cast<int>(ids.size());
+    const int to = insertSlot;
+    if (n < 2 || from < 0 || to < 0 || to >= n || to == from) {
+        damage(); // nothing to do → ghost snaps back
+        return;
+    }
+    const int lo = std::min(from, to), hi = std::max(from, to);
+
+    // snapshot each affected workspace's window set (all windows carrying that m_workspace, so
+    // group members move together) + custom names, BEFORE any mutation (collect-then-move).
+    std::vector<std::vector<PHLWINDOW>> units(n);
+    std::vector<std::string>            names(n);
+    std::vector<bool>                   hadCustom(n, false);
+    for (int k = lo; k <= hi; ++k) {
+        const auto ws = g_pCompositor->getWorkspaceByID(ids[k]);
+        if (!ws) {
+            damage();
+            return;
+        }
+        names[k]     = ws->m_name;
+        hadCustom[k] = (ws->m_name != std::to_string(ids[k]));
+        for (const auto& w : g_pCompositor->m_windows)
+            if (w && !w->m_pinned && w->m_workspace == ws)
+                units[k].push_back(w);
+    }
+
+    // capture tile boxes for the glide + the displayed workspace (to follow its content on close)
+    std::vector<std::pair<PHLWINDOW, LRect>> oldBoxes;
+    oldBoxes.reserve(m_tiles.size());
+    for (size_t i = 0; i < m_tiles.size(); ++i)
+        if (const auto win = m_tiles[i].win.lock())
+            oldBoxes.emplace_back(win, currentBox(m_tiles[i], static_cast<int>(i)));
+    const auto   dispWs      = m_workspace.lock();
+    const double savedScroll = m_stripScroll;
+
+    // hold every affected workspace persistent for the session so an emptied slot isn't reaped
+    // mid-overview (keeps the same set of numbered cards). Released in deactivate()/hardClose().
+    for (int k = lo; k <= hi; ++k)
+        if (const auto ws = g_pCompositor->getWorkspaceByID(ids[k])) {
+            ws->setPersistent(true);
+            m_heldWs.emplace_back(ws);
+        }
+
+    // temp slot: every hop lands in a JUST-EMPTIED workspace so moveWindowToWorkspaceSafe's
+    // fullscreen/group handling never collides with resident windows.
+    WORKSPACEID tid = ids.back() + 1;
+    while (g_pCompositor->getWorkspaceByID(tid))
+        ++tid;
+    const auto temp = g_pCompositor->createNewWorkspace(tid, m->m_id, "", false);
+    if (!temp) {
+        damage();
+        return;
+    }
+    temp->setPersistent(true);
+
+    const auto moveUnits = [](const std::vector<PHLWINDOW>& vec, const PHLWORKSPACE& dst) {
+        if (!dst)
+            return;
+        for (const auto& w : vec)
+            if (w && w->m_workspace != dst)
+                g_pCompositor->moveWindowToWorkspaceSafe(w, dst);
+    };
+    const auto wsAt = [&](int k) { return g_pCompositor->getWorkspaceByID(ids[k]); };
+
+    // rotation over [lo..hi]: dragged content -> temp; shift the in-between; temp's -> dest.
+    moveUnits(units[from], temp);
+    if (from < to)
+        for (int k = from + 1; k <= to; ++k)
+            moveUnits(units[k], wsAt(k - 1));
+    else
+        for (int k = from - 1; k >= to; --k)
+            moveUnits(units[k], wsAt(k + 1));
+    moveUnits(units[from], wsAt(to)); // units[from] now lives on temp; drain it to the destination
+
+    // custom names travel with content: content from position srcOf(k) now sits at slot k.
+    const auto srcOf = [&](int k) -> int {
+        if (k == to)
+            return from;
+        return (from < to) ? k + 1 : k - 1;
+    };
+    for (int k = lo; k <= hi; ++k) {
+        const auto wsk = g_pCompositor->getWorkspaceByID(ids[k]);
+        if (!wsk)
+            continue;
+        const int         src  = srcOf(k);
+        const std::string want = hadCustom[src] ? names[src] : std::to_string(ids[k]);
+        if (wsk->m_name != want)
+            wsk->rename(want);
+    }
+
+    temp->setPersistent(false); // empty + unfocused → reaped
+
+    // follow the displayed content to the numbered slot now holding it
+    if (dispWs) {
+        int p = -1;
+        for (int k = 0; k < n; ++k)
+            if (g_pCompositor->getWorkspaceByID(ids[k]) == dispWs) {
+                p = k;
+                break;
+            }
+        if (p >= 0) {
+            const auto destOf = [&](int q) -> int {
+                if (q == from)
+                    return to;
+                if (from < to && q > from && q <= to)
+                    return q - 1;
+                if (from > to && q < from && q >= to)
+                    return q + 1;
+                return q;
+            };
+            const int d = destOf(p);
+            if (d != p)
+                m_workspace = g_pCompositor->getWorkspaceByID(ids[d]);
+        }
+    }
+
+    // rebuild: buildStrip re-sorts by id, so the cards land exactly where the drop preview showed.
+    m_hovered = m_hoveredStrip = -1;
+    replayReflow(oldBoxes);
+    m_stripScroll = std::clamp(savedScroll, 0.0, m_stripScrollMax);
     damage();
 }
 
@@ -2928,6 +3257,15 @@ void Overview::deactivate() {
     if (const auto ws = m_newWs.lock())
         ws->setPersistent(false);
     m_newWs.reset();
+
+    // release workspaces pinned during a reorder; an emptied slot then reaps like any other
+    for (const auto& wref : m_heldWs)
+        if (const auto ws = wref.lock())
+            ws->setPersistent(false);
+    m_heldWs.clear();
+    m_pressStrip    = -1;
+    m_stripDragging = false;
+    m_stripDropIdx  = -1;
 
     m_active  = false;
     m_opening = false;
