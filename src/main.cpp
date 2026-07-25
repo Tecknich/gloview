@@ -132,6 +132,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     addColor("plugin:gloview:strip_plus_color", Config::INTEGER{0xd0eef4ffLL});
     addColor("plugin:gloview:shadow_color", Config::INTEGER{0x70000000LL});
     addColor("plugin:gloview:hover_border", Config::INTEGER{0xf0ffffffLL});
+    addColor("plugin:gloview:preview_bg", Config::INTEGER{0xff14181fLL}); // opaque backing behind each preview (was read but never registered)
 
     // --- input / keyboard navigation ---
     addInt("plugin:gloview:focus_follows_mouse", Config::INTEGER{1});      // keyboard selection tracks the hovered tile
@@ -159,7 +160,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     addStr("plugin:gloview:key_down", "down");
     addStr("plugin:gloview:key_desktop", "shift");        // flip canvas<->grid
     addStr("plugin:gloview:key_all_workspaces", "a");     // toggle the all-workspaces (expo) view; "" disables
-    addStr("plugin:gloview:key_workspace", "1,2,3,4,5,6,7,8,9,0"); // each key switches to the Nth strip card's workspace (slot position = card index)
+    addStr("plugin:gloview:key_workspace", "1,2,3,4,5,6,7,8,9,0"); // each key switches to the Nth NUMBERED workspace card (special/scratchpad cards don't count)
 
     // --- workspace scope / strip contents ---
     addInt("plugin:gloview:show_all_workspaces", Config::INTEGER{0}); // main area shows every window on the monitor (expo), not just the displayed workspace
@@ -189,6 +190,8 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         // attempt (two instances can't hook shouldRenderWindow twice).
         throw std::runtime_error("[gloview] initialization failed");
     }
+
+    gloview::registerOverviewEvent(handle); // "gloview:overview" custom bus event (no-op on 0.55)
 
     HyprlandAPI::addDispatcherV2(handle, "gloview:toggle", dispToggle);
     HyprlandAPI::addDispatcherV2(handle, "gloview:open", dispOpen);
@@ -280,5 +283,6 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 
 APICALL EXPORT void PLUGIN_EXIT() {
     g_manager = nullptr;
-    g_managerOwned.reset();
+    g_managerOwned.reset(); // may emit a final "closed" — before the event goes away
+    gloview::unregisterOverviewEvent(g_handle);
 }

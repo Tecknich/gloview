@@ -22,6 +22,7 @@
 
 namespace Render {
 class ITexture;
+class IFramebuffer;
 }
 
 #include "layout.hpp"
@@ -46,6 +47,15 @@ struct ConfigRegistry {
 inline ConfigRegistry g_config;
 
 class Overview;
+
+// 0.56 interop: custom bus event "gloview:overview" (TYPE_MONITOR, TYPE_STRING name,
+// TYPE_BOOL open) — emitted per monitor on open and on full close, so in-process
+// consumers (bars) can hide themselves. Delivery is DEFERRED via an event-loop timer
+// (never from inside a render pass or a m_views iteration); per monitor the open/close
+// edges alternate strictly: one `true` per active episode, then one `false`.
+// Both functions are no-ops on 0.55.4.
+void registerOverviewEvent(HANDLE handle);   // PLUGIN_INIT
+void unregisterOverviewEvent(HANDLE handle); // PLUGIN_EXIT (mandatory: unload never cleans custom events)
 
 // Owns everything global-and-once (the shouldRenderWindow hooks, the event-bus
 // listeners) and one Overview per monitor. toggle/open/close act on EVERY monitor
@@ -223,6 +233,9 @@ class Overview {
     // stale-size buffer) reuse its last good snapshot instead of re-snapshotting into a
     // stretched/black thumbnail. Persists across the per-open tile/strip rebuilds.
     std::unordered_map<void*, LRect>      m_snapGeom;
+    // 0.56 only (unused on 0.55, where the FB lives on the CWindow): the last snapshot
+    // FB per window, keyed like m_snapGeom; the weak ref lets dead windows' FBs free.
+    std::unordered_map<void*, std::pair<PHLWINDOWREF, SP<Render::IFramebuffer>>> m_snapFBs;
     // layer surfaces (bars/popups) we faded out while up, with their pre-hide alpha
     // goal, so deactivate() restores them exactly — even if config changed meanwhile.
     std::vector<std::pair<PHLLSREF, float>> m_hiddenLayers;
@@ -282,6 +295,11 @@ class Overview {
     // horizontal strip (cards in a row); Left/Right give a vertical strip (cards
     // in a column).
     enum class Anchor { Top, Bottom, Left, Right };
+    // Physical-DPI factor (1..2) applied ONLY to hardcoded chrome constants (label band,
+    // font sizes, the strip_height default) — never to user-set config values. 1.0 when
+    // the output reports no physical size (VMs/projectors).
+    double   uiScale() const;
+    double   labelBand() const;          // height reserved above each strip card for its name
     Anchor   stripAnchor() const;        // plugin:gloview:anchor (falls back to bar_position)
     bool     stripHorizontal() const;    // Top or Bottom
     double   stripThickness() const;     // band size perpendicular to its edge (strip_height)
@@ -307,7 +325,11 @@ class Overview {
     LRect  dragBox() const;                        // the picked-up tile's box at the cursor
     LRect  dragCardBox() const;                    // the picked-up workspace card following the cursor (full card size)
     int    stripIndexOfWs(int wsId) const;         // m_strip index of the real card with this ws id, else -1
-    int    stripInsertIndexAt(double lx, double ly) const; // reorder insertion slot among real cards; -1 outside band
+    // card takes part in drag-reorder: a real, live, NUMBERED workspace (special/scratchpad
+    // cards have id < 0 and are excluded). Shared by stripInsertIndexAt, the insertion-bar
+    // renderer and reorderWorkspaces so all three index spaces agree.
+    static bool reorderableCard(const StripItem& it);
+    int    stripInsertIndexAt(double lx, double ly) const; // reorder insertion slot among reorderable cards; -1 outside band
     void   reorderWorkspaces(int insertSlot);      // move window contents so the dragged card takes slot `insertSlot`
     // tile chrome (shadow/border/backing/title). onMon overrides the target monitor
     // (scale + label clamping) when the tile is drawn on a foreign monitor mid-drag.
