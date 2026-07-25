@@ -190,6 +190,8 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         throw std::runtime_error("[gloview] initialization failed");
     }
 
+    gloview::registerOverviewEvent(handle); // "gloview:overview" custom bus event (no-op on 0.55)
+
     HyprlandAPI::addDispatcherV2(handle, "gloview:toggle", dispToggle);
     HyprlandAPI::addDispatcherV2(handle, "gloview:open", dispOpen);
     HyprlandAPI::addDispatcherV2(handle, "gloview:close", dispClose);
@@ -280,5 +282,6 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 
 APICALL EXPORT void PLUGIN_EXIT() {
     g_manager = nullptr;
-    g_managerOwned.reset();
+    g_managerOwned.reset(); // may emit a final "closed" — before the event goes away
+    gloview::unregisterOverviewEvent(g_handle);
 }
