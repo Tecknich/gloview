@@ -82,6 +82,11 @@ class Manager {
     Overview* viewFor(const PHLMONITOR& m) const;
     Overview* dragSource() const; // the view with a live tile drag, if any (cross-monitor drag)
 
+    // true between RENDER_BEGIN and RENDER_POST — stages only renderMonitor() emits.
+    // Offscreen workspace re-renders (hyprcapture's FULL_FAKE renderWorkspace) never
+    // bracket, so views can tell a real frame from a capture pass.
+    bool inMonitorPass() const { return m_inMonitorPass; }
+
   private:
     bool      anyOpen() const;   // some view is up and not closing
     bool      anyActive() const; // some view is up (including the close animation)
@@ -94,6 +99,7 @@ class Manager {
     std::vector<std::unique_ptr<Overview>> m_views;
 
     CHyprSignalListener m_renderStageL;
+    bool                m_inMonitorPass = false;
     CHyprSignalListener m_mouseButtonL;
     CHyprSignalListener m_mouseAxisL;
     CHyprSignalListener m_mouseMoveL;
@@ -132,6 +138,7 @@ class Overview {
 
     // wired to Hyprland's event bus / render pass
     void renderStage(eRenderStage stage);
+    void queueOverlayPasses(); // pass-building only (no state advance): shared by the live frame and offscreen capture re-renders
     void renderBackdrop() const;
     void renderStrip() const;
     void renderStripWindows() const; // live window surfaces inside the strip cards
@@ -262,8 +269,13 @@ class Overview {
     int                                   m_newCardId    = 0; // workspace id of the animating card (0 = none)
     bool                                  m_newCardAnim  = false;
     std::chrono::steady_clock::time_point m_newCardStart;
-    PHLWORKSPACEREF                       m_newWs;            // freshly "+"-created ws, held persistent until close so it isn't reaped empty
-    std::vector<PHLWORKSPACEREF>          m_heldWs;           // workspaces pinned persistent during a reorder; released at deactivate()/hardClose()
+    // Strong refs (NOT setPersistent pins): a plugin-held SP keeps the workspace
+    // alive; dropping it at close lets an empty+inactive one reap immediately.
+    // setPersistent leaked here before (single-slot overwrite) and 0.56's rename
+    // path strips non-rule persistent flags mid-session (downgrade pass), so
+    // plugin-side refs are the only pin that survives both versions.
+    std::vector<PHLWORKSPACE>             m_newWs;            // every "+"-created ws this session; released at close
+    std::vector<PHLWORKSPACE>             m_heldWs;           // workspaces held alive during a reorder; released at close
     double                                m_stripScroll = 0.0;    // strip group scroll offset along its main axis
     double                                m_stripScrollMax = 0.0; // max scroll (0 when the cards fit the band)
     std::chrono::steady_clock::time_point m_lastWsScroll;         // last touchpad workspace-step time (cooldown throttle; default-ctor == epoch so the first scroll always fires)
