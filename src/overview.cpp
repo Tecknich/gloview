@@ -674,14 +674,36 @@ bool Overview::stripHorizontal() const {
     return a == Anchor::Top || a == Anchor::Bottom;
 }
 
+// Physical-DPI factor for HARDCODED chrome constants only (label band, font sizes,
+// the strip floor) — user-set config values are never multiplied. 96 logical DPI
+// (m_scale already factored out) = 1.0, clamped so odd EDIDs can't produce toy or
+// giant chrome; 1.0 when the output reports no physical size (VMs / projectors).
+double Overview::uiScale() const {
+    const auto m = m_monitor.lock();
+    if (!m || !m->m_output)
+        return 1.0;
+    const double mmW = m->m_output->physicalSize.x;
+    if (mmW <= 0.0 || m->m_pixelSize.x <= 0.0)
+        return 1.0;
+    const double logicalDPI = (m->m_pixelSize.x / (mmW / 25.4)) / std::max(0.25, static_cast<double>(m->m_scale));
+    return std::clamp(logicalDPI / 96.0, 1.0, 2.0);
+}
+
+// height reserved above every strip card for its name label (buildStrip + both label draws)
+double Overview::labelBand() const {
+    return 26.0 * uiScale();
+}
+
 double Overview::stripThickness() const {
     const auto m = m_monitor.lock();
     if (!m)
         return 150.0;
     // clamp against the axis perpendicular to the band: height for a horizontal
-    // strip, width for a vertical one.
+    // strip, width for a vertical one. The default/floor ride uiScale() so the
+    // default-config strip isn't toy-sized on a high-DPI output.
     const double cross = stripHorizontal() ? m->m_size.y : m->m_size.x;
-    return std::clamp(static_cast<double>(cfgInt("plugin:gloview:strip_height", 150)), 100.0, cross * 0.42);
+    const double u     = uiScale();
+    return std::clamp(static_cast<double>(cfgInt("plugin:gloview:strip_height", static_cast<int>(150 * u))), 100.0 * u, cross * 0.42);
 }
 
 double Overview::stripOffset() const {
@@ -933,6 +955,11 @@ bool Overview::tileBelongs(const PHLWINDOW& w, const PHLMONITOR& m, const PHLWOR
     const auto wws = w->m_workspace;
     if (!wws)
         return false;
+    // an ACTIVE special workspace (open scratchpad) joins the main area in every mode:
+    // its windows float above the displayed workspace and shouldHideWindow suppresses
+    // them while up, so without tiles they'd simply vanish for the session.
+    if (m && wws == m->m_activeSpecialWorkspace)
+        return true;
     if (showAllWorkspaces()) { // expo: every window living on this monitor, any workspace
         if (wws->m_isSpecialWorkspace && cfgInt("plugin:gloview:show_special", 0) == 0)
             return false;
@@ -968,7 +995,8 @@ void Overview::buildTiles() {
     // cache each window's title texture, drawn under the tile on hover.
     if (g_pHyprOpenGL && g_pHyprRenderer) {
         g_pHyprOpenGL->makeEGLCurrent();
-        const auto lblCol = CHyprColor(1.0, 1.0, 1.0, 0.96);
+        const auto   lblCol = CHyprColor(1.0, 1.0, 1.0, 0.96);
+        const double u      = uiScale(); // DPI-scale the hardcoded font sizes
         for (auto& t : m_tiles) {
             const auto w = t.win.lock();
             if (!w)
@@ -978,11 +1006,11 @@ void Overview::buildTiles() {
                 text = w->m_class;
             if (text.size() > 80)
                 text = text.substr(0, 79) + "…";
-            t.label = g_pHyprRenderer->renderText(text, lblCol, 15, false, "", 0, 700);
+            t.label = g_pHyprRenderer->renderText(text, lblCol, static_cast<int>(std::lround(15 * u)), false, "", 0, 700);
         }
         // pre-render the desktop-mode "✕" glyph once (rendering text mid-pass is unsafe)
         if (!m_closeGlyph)
-            m_closeGlyph = g_pHyprRenderer->renderText("✕", CHyprColor(1.0, 1.0, 1.0, 1.0), 16, false, "", 0, 800);
+            m_closeGlyph = g_pHyprRenderer->renderText("✕", CHyprColor(1.0, 1.0, 1.0, 1.0), static_cast<int>(std::lround(16 * u)), false, "", 0, 800);
     }
 }
 
@@ -1008,7 +1036,9 @@ void Overview::buildStrip() {
         if (!ws || ws->m_monitor.lock() != m)
             continue;
         if (ws->m_isSpecialWorkspace) {
-            if (showSpecial && wsHasWindows(ws)) // a scratchpad is only meaningful when populated
+            // a scratchpad is only meaningful when populated; one that's OPEN right now
+            // gets a card even without show_special (its windows are on screen).
+            if ((showSpecial || ws == m->m_activeSpecialWorkspace) && wsHasWindows(ws))
                 wss.push_back(ws);
             continue;
         }
@@ -1063,18 +1093,19 @@ void Overview::buildStrip() {
     if (g_pHyprOpenGL && g_pHyprRenderer) {
         g_pHyprOpenGL->makeEGLCurrent();
         const auto lblCol = CHyprColor(1.0, 1.0, 1.0, 0.92);
+        const int  lblPt  = static_cast<int>(std::lround(13 * uiScale())); // DPI-scaled
         for (auto& it : m_strip) {
             if (it.isPlus)
                 continue;
             if (it.isAll) {
-                it.label = g_pHyprRenderer->renderText("All workspaces", lblCol, 13, false, "", 0, 600);
+                it.label = g_pHyprRenderer->renderText("All workspaces", lblCol, lblPt, false, "", 0, 600);
                 continue;
             }
             const auto ws = it.ws.lock();
             std::string nm = ws ? ws->m_name : std::to_string(it.id);
             const bool numeric = !nm.empty() && std::all_of(nm.begin(), nm.end(), [](char c) { return std::isdigit(static_cast<unsigned char>(c)); });
             const std::string text = numeric ? ("Workspace " + nm) : nm;
-            it.label               = g_pHyprRenderer->renderText(text, lblCol, 13, false, "", 0, 600);
+            it.label               = g_pHyprRenderer->renderText(text, lblCol, lblPt, false, "", 0, 600);
         }
     }
 
@@ -1087,7 +1118,7 @@ void Overview::buildStrip() {
     const bool   horiz  = stripHorizontal();
     const double margin = cfgInt("plugin:gloview:strip_margin", 22);
     const double gap    = cfgInt("plugin:gloview:strip_gap", 18);
-    const double labelH = 26.0;
+    const double labelH = labelBand();
     const double aspect = m->m_size.x / std::max(1.0, m->m_size.y);
 
     double cardW, cardH;
@@ -1629,10 +1660,10 @@ void Overview::renderStrip() const {
                 lw *= s;
                 lh *= s;
             }
-            // labelH (26) is reserved above every card by buildStrip (both layouts).
-            const double labelBand = 26.0;
+            // labelH (labelBand()) is reserved above every card by buildStrip (both layouts).
+            const double lband     = labelBand();
             const double lx        = card.cx() - lw / 2.0;
-            const double ly        = card.y - labelBand + (labelBand - lh) / 2.0;
+            const double ly        = card.y - lband + (lband - lh) / 2.0;
             const float  la        = it.active ? static_cast<float>(e) : static_cast<float>(e) * 0.75F;
             g_pHyprOpenGL->renderTexture(it.label, pxb(CBox(lx, ly, lw, lh), s), {.a = la});
         }
@@ -2527,9 +2558,9 @@ void Overview::renderDragStripCard() const {
             lw *= sc;
             lh *= sc;
         }
-        const double labelBand = 26.0;
+        const double lband = labelBand();
         const double llx = card.cx() - lw / 2.0;
-        const double lly = card.y - labelBand + (labelBand - lh) / 2.0;
+        const double lly = card.y - lband + (lband - lh) / 2.0;
         g_pHyprOpenGL->renderTexture(it.label, pxb(CBox(llx, lly, lw, lh), s), {.a = static_cast<float>(e)});
     }
 }
@@ -2540,6 +2571,8 @@ void Overview::renderDragStripCard() const {
 // CONTENTS are rotated across the fixed numbered slots, so the id-sorted strip shows the new order
 // and $mod+N / hyprstatus / the number-row keys stay correct by construction. Custom workspace
 // names travel with their content.
+// TODO(0.56): still no upstream alternative — workspacePlacementController only swaps across
+// monitors and CWorkspace::m_id still has no setter, so content-rotation stays the mechanism.
 void Overview::reorderWorkspaces(int insertSlot) {
     const auto m = m_monitor.lock();
     if (!m) {
@@ -3325,6 +3358,9 @@ bool Overview::shouldHideWindow(const PHLWINDOW& w, const PHLMONITOR& mon) const
     // also hide the monitor's active workspace, so displaying a different desktop
     // doesn't bleed the current one through the translucent backdrop.
     if (const auto aw = m->m_activeWorkspace; aw && w->m_workspace == aw)
+        return true;
+    // same for an open scratchpad floating above it (its windows have tiles instead).
+    if (const auto sws = m->m_activeSpecialWorkspace; sws && w->m_workspace == sws)
         return true;
     return false;
 }

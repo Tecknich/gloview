@@ -132,6 +132,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     addColor("plugin:gloview:strip_plus_color", Config::INTEGER{0xd0eef4ffLL});
     addColor("plugin:gloview:shadow_color", Config::INTEGER{0x70000000LL});
     addColor("plugin:gloview:hover_border", Config::INTEGER{0xf0ffffffLL});
+    addColor("plugin:gloview:preview_bg", Config::INTEGER{0xff14181fLL}); // opaque backing behind each preview (was read but never registered)
 
     // --- input / keyboard navigation ---
     addInt("plugin:gloview:focus_follows_mouse", Config::INTEGER{1});      // keyboard selection tracks the hovered tile
