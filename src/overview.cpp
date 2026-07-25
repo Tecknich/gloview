@@ -386,9 +386,8 @@ Overview::~Overview() {
     m_opening = false;
     restoreLayers(); // never leave a bar stuck at alpha 0 if we're torn down mid-hide
     restoreFill();   // never leave a window's surface stuck stretching its small buffer
-    if (const auto ws = m_newWs.lock()) // don't leak a persistent workspace either
-        ws->setPersistent(false);
-    m_newWs.reset();
+    m_newWs.clear();  // drop strong refs: unreferenced empty workspaces reap now
+    m_heldWs.clear();
     m_tiles.clear();
     m_strip.clear();
     if (m_recaptureTimer && g_pEventLoopManager) {
@@ -486,6 +485,12 @@ bool Manager::initialize() {
 
     // Render stages self-route: every view checks the pass monitor against its own.
     m_renderStageL = events.render.stage.listen([this](eRenderStage stage) {
+        // RENDER_BEGIN/RENDER_POST are emitted only by renderMonitor(): they bracket a
+        // real on-screen pass. Offscreen re-renders (hyprcapture) skip both.
+        if (stage == RENDER_BEGIN)
+            m_inMonitorPass = true;
+        else if (stage == RENDER_POST)
+            m_inMonitorPass = false;
         for (const auto& v : m_views)
             v->renderStage(stage);
     });
@@ -882,7 +887,8 @@ void Overview::open() {
     m_desktopMode = false; // open into the tidy grid; Shift / gloview:desktop flips to the canvas
     m_newCardAnim = false;
     m_newCardId   = 0;
-    m_newWs.reset();
+    m_newWs.clear(); // defensive: a previous session's refs were already dropped at close
+    m_heldWs.clear();
 
     buildTiles();
     buildStrip();
@@ -962,12 +968,7 @@ void Overview::hardClose() {
 
     restoreLayers(); // never leave a bar stuck at alpha 0 if we tear down mid-hide
     restoreFill();   // never leave a window's surface stuck stretching its small buffer
-    if (const auto ws = m_newWs.lock()) // don't leak a held-persistent "+"-created workspace
-        ws->setPersistent(false);
-    m_newWs.reset();
-    for (const auto& wref : m_heldWs) // nor a reorder-pinned workspace
-        if (const auto ws = wref.lock())
-            ws->setPersistent(false);
+    m_newWs.clear();  // drop "+"-created and reorder holds: empty ones reap now
     m_heldWs.clear();
 
     m_active            = false;
@@ -1536,6 +1537,16 @@ void Overview::renderStage(eRenderStage stage) {
     if (!rm || !m || rm != m)
         return;
 
+    // Offscreen workspace re-render (hyprcapture's FULL_FAKE + renderWorkspace):
+    // renderMonitor-only stages never fire there, so queue the overlay at the last
+    // stage the fake pass DOES emit. Pass-building only — animation, hover, dismiss
+    // logic and damage stay on the real frame.
+    if (!g_manager->inMonitorPass()) {
+        if (m_active && stage == RENDER_POST_WINDOWS)
+            queueOverlayPasses();
+        return;
+    }
+
     if (stage != RENDER_LAST_MOMENT)
         return;
 
@@ -1553,6 +1564,29 @@ void Overview::renderStage(eRenderStage stage) {
         g_manager->close();                 // a dismiss dismisses EVERY monitor's overview
     }
 
+    queueOverlayPasses();
+
+    // Final close frame: the overlay (opaque previews at natural positions) is now queued,
+    // covering the windows shouldRenderWindow suppressed earlier this frame. Flip off NOW,
+    // after the pass is built, so the NEXT frame renders the real windows — pixel-perfect
+    // handoff, no transparent gap. The queued surfaces already captured their data; the
+    // deferred chrome callbacks no-op at progress 0. deactivate() damages the next frame.
+    if (m_pendingDeactivate) {
+        m_pendingDeactivate = false;
+        deactivate();
+        return;
+    }
+
+    // Repaint every frame while up. Event-driven redraws let transient artifacts (partial
+    // damage-region blur edges, snapshot mid-reflow, leftover hover rings) persist until the
+    // next event; continuous repaint clears any such residue on the following frame.
+    damage();
+}
+
+void Overview::queueOverlayPasses() {
+    const auto m = m_monitor.lock();
+    if (!m)
+        return;
     // Layer order: backdrop + main tile chrome → main surfaces → strip chrome → strip
     // surfaces → drag chrome → drag surface → cursor. The immediate-mode chrome is split
     // across COverlayPass phases so the queued surfaces slot between them.
@@ -1582,22 +1616,6 @@ void Overview::renderStage(eRenderStage stage) {
     pass.add(makeUnique<COverlayPass>(this, COverlayPass::Phase::Front));
 
     renderAboveLayers(); // opted-in layer surfaces (e.g. the live-input HUD) sit on top of the overview
-
-    // Final close frame: the overlay (opaque previews at natural positions) is now queued,
-    // covering the windows shouldRenderWindow suppressed earlier this frame. Flip off NOW,
-    // after the pass is built, so the NEXT frame renders the real windows — pixel-perfect
-    // handoff, no transparent gap. The queued surfaces already captured their data; the
-    // deferred chrome callbacks no-op at progress 0. deactivate() damages the next frame.
-    if (m_pendingDeactivate) {
-        m_pendingDeactivate = false;
-        deactivate();
-        return;
-    }
-
-    // Repaint every frame while up. Event-driven redraws let transient artifacts (partial
-    // damage-region blur edges, snapshot mid-reflow, leftover hover rings) persist until the
-    // next event; continuous repaint clears any such residue on the following frame.
-    damage();
 }
 
 void Overview::renderBackdrop() const {
@@ -2688,13 +2706,11 @@ void Overview::reorderWorkspaces(int insertSlot) {
     const auto   dispWs      = m_workspace.lock();
     const double savedScroll = m_stripScroll;
 
-    // hold every affected workspace persistent for the session so an emptied slot isn't reaped
+    // hold every affected workspace alive for the session so an emptied slot isn't reaped
     // mid-overview (keeps the same set of numbered cards). Released in deactivate()/hardClose().
     for (int k = lo; k <= hi; ++k)
-        if (const auto ws = Compat::workspaceByID(ids[k])) {
-            ws->setPersistent(true);
+        if (const auto ws = Compat::workspaceByID(ids[k]))
             m_heldWs.emplace_back(ws);
-        }
 
     // temp slot: every hop lands in a JUST-EMPTIED workspace so moveWindowToWorkspaceSafe's
     // fullscreen/group handling never collides with resident windows.
@@ -2706,7 +2722,6 @@ void Overview::reorderWorkspaces(int insertSlot) {
         damage();
         return;
     }
-    temp->setPersistent(true);
 
     const auto moveUnits = [](const std::vector<PHLWINDOW>& vec, const PHLWORKSPACE& dst) {
         if (!dst)
@@ -2743,7 +2758,7 @@ void Overview::reorderWorkspaces(int insertSlot) {
             wsk->rename(want);
     }
 
-    temp->setPersistent(false); // empty + unfocused → reaped
+    // `temp` is released when the local strong ref goes out of scope → reaped
 
     // follow the displayed content to the numbered slot now holding it
     if (dispWs) {
@@ -3357,11 +3372,10 @@ void Overview::addWorkspace() {
     const auto ws = Compat::createWorkspace(id, m->m_id, "", false);
     if (!ws)
         return;
-    // A new empty workspace is reaped within a frame or two unless focused. Hold it
-    // persistent so its card survives while up; deactivate() releases it (normal reaping
-    // applies after).
-    ws->setPersistent(true);
-    m_newWs        = ws;
+    // A new empty workspace is reaped within a frame or two unless referenced. Hold a
+    // strong ref so its card survives while the overview is up; close releases ALL of
+    // them (multiple "+" presses each get a slot — a single slot leaked pins before).
+    m_newWs.emplace_back(ws);
     m_newCardId    = id;
     m_newCardStart = std::chrono::steady_clock::now();
     m_newCardAnim  = true;
@@ -3441,16 +3455,9 @@ void Overview::deactivate() {
             m->changeWorkspace(ws, false, true, false);
     }
 
-    // Drop the hold on a "+"-created workspace: it stays if active or a window landed
-    // there, otherwise reaps like any empty one.
-    if (const auto ws = m_newWs.lock())
-        ws->setPersistent(false);
-    m_newWs.reset();
-
-    // release workspaces pinned during a reorder; an emptied slot then reaps like any other
-    for (const auto& wref : m_heldWs)
-        if (const auto ws = wref.lock())
-            ws->setPersistent(false);
+    // Drop every hold ("+"-created and reorder-held): a workspace stays if active or
+    // a window landed there, otherwise it reaps like any empty one.
+    m_newWs.clear();
     m_heldWs.clear();
     m_pressStrip    = -1;
     m_stripDragging = false;
