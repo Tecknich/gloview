@@ -160,7 +160,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     addStr("plugin:gloview:key_down", "down");
     addStr("plugin:gloview:key_desktop", "shift");        // flip canvas<->grid
     addStr("plugin:gloview:key_all_workspaces", "a");     // toggle the all-workspaces (expo) view; "" disables
-    addStr("plugin:gloview:key_workspace", "1,2,3,4,5,6,7,8,9,0"); // each key switches to the Nth strip card's workspace (slot position = card index)
+    addStr("plugin:gloview:key_workspace", "1,2,3,4,5,6,7,8,9,0"); // each key switches to the Nth NUMBERED workspace card (special/scratchpad cards don't count)
 
     // --- workspace scope / strip contents ---
     addInt("plugin:gloview:show_all_workspaces", Config::INTEGER{0}); // main area shows every window on the monitor (expo), not just the displayed workspace

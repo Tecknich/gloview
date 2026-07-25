@@ -214,6 +214,32 @@ bool hkShouldRenderWindowAny(void* thisptr, PHLWINDOW window) {
 // up. `open=true` fires when a view activates; `open=false` once the overlay is fully
 // gone (deactivate/hardClose — close() only STARTS the close animation).
 SP<Event::CEventBus::CCustomEvent> g_overviewEvent;
+
+// Deferred delivery. CCustomEvent::emit() is synchronous and Hyprland's Lua runtime
+// auto-subscribes every plugin event, but every emit site here sits inside a render
+// stage (deactivate ← renderStage, with the pass half-built) or a Manager::m_views
+// loop (open/hardClose/toggleAllWorkspaces/dtor). Emitting there hands control to
+// arbitrary config code mid-render-pass, and a handler that reenters gloview
+// (hl.dispatch("gloview:toggle") → prune()/ensureView()) mutates m_views under the
+// running loop → UAF. So: queue, and flush from an event-loop timer, which fires
+// between frames off the render stack (same pattern and unload rules as
+// m_recaptureTimer — the timer MUST be gone before dlclose).
+struct SPendingOverviewEmit {
+    PHLMONITORREF mon;
+    std::string   name; // captured at queue time so name-keyed consumers survive a monitor death
+    bool          open = false;
+};
+std::vector<SPendingOverviewEmit> g_pendingEmits;
+SP<CEventLoopTimer>               g_emitTimer;
+
+void flushOverviewEmits() {
+    auto pending = std::move(g_pendingEmits);
+    g_pendingEmits.clear(); // moved-from: make the reentrancy-safe empty state explicit
+    if (!g_overviewEvent)
+        return;
+    for (const auto& p : pending)
+        (void)g_overviewEvent->emit({p.mon, p.name, p.open}); // types match m_argTypes by construction
+}
 #endif
 
 // no-op on 0.55.4 (no custom-event machinery exists there)
@@ -221,7 +247,15 @@ void emitOverviewState(const PHLMONITOR& m, bool open) {
 #ifdef GV_HYPRLAND_056
     if (!g_overviewEvent || !m)
         return;
-    (void)g_overviewEvent->emit({PHLMONITORREF{m}, m->m_name, open}); // types match m_argTypes by construction
+    g_pendingEmits.push_back({PHLMONITORREF{m}, m->m_name, open});
+    if (!g_pEventLoopManager)
+        return; // nothing to defer to — stays queued (unregisterOverviewEvent's final flush drains it)
+    if (!g_emitTimer) {
+        g_emitTimer = makeShared<CEventLoopTimer>(
+            std::chrono::milliseconds(0), [](SP<CEventLoopTimer>, void*) { flushOverviewEmits(); }, nullptr);
+        g_pEventLoopManager->addTimer(g_emitTimer);
+    } else
+        g_emitTimer->updateTimeout(std::chrono::milliseconds(0));
 #else
     (void)m;
     (void)open;
@@ -322,6 +356,17 @@ void registerOverviewEvent(HANDLE handle) {
 
 void unregisterOverviewEvent(HANDLE handle) {
 #ifdef GV_HYPRLAND_056
+    // Final flush BEFORE the event dies: PLUGIN_EXIT runs outside any render pass and the
+    // views are already destroyed (their dtors queued the closing `false`s), so a
+    // synchronous drain is safe here and no consumer is left thinking a monitor is open.
+    flushOverviewEmits();
+    if (g_emitTimer) { // the timer must die before dlclose — its callback lives in this .so
+        g_emitTimer->cancel();
+        if (g_pEventLoopManager)
+            g_pEventLoopManager->removeTimer(g_emitTimer);
+        g_emitTimer.reset();
+    }
+    g_pendingEmits.clear();
     if (!g_overviewEvent)
         return;
     HyprlandAPI::removeEvent(handle, g_overviewEvent->m_name);
@@ -675,7 +720,7 @@ bool Overview::stripHorizontal() const {
 }
 
 // Physical-DPI factor for HARDCODED chrome constants only (label band, font sizes,
-// the strip floor) — user-set config values are never multiplied. 96 logical DPI
+// the strip_height default) — user-set config values are never multiplied. 96 logical DPI
 // (m_scale already factored out) = 1.0, clamped so odd EDIDs can't produce toy or
 // giant chrome; 1.0 when the output reports no physical size (VMs / projectors).
 double Overview::uiScale() const {
@@ -699,11 +744,16 @@ double Overview::stripThickness() const {
     if (!m)
         return 150.0;
     // clamp against the axis perpendicular to the band: height for a horizontal
-    // strip, width for a vertical one. The default/floor ride uiScale() so the
-    // default-config strip isn't toy-sized on a high-DPI output.
+    // strip, width for a vertical one. strip_height is ALWAYS registered (main.cpp), so
+    // cfgInt's fallback argument can never apply — DPI-scale the default by hand instead:
+    // the untouched registered default (150) rides uiScale() so the default-config strip
+    // isn't toy-sized on a high-DPI output, while an explicit user value (and the 100px
+    // floor it clamps against) is honored unscaled, per the uiScale() contract.
     const double cross = stripHorizontal() ? m->m_size.y : m->m_size.x;
-    const double u     = uiScale();
-    return std::clamp(static_cast<double>(cfgInt("plugin:gloview:strip_height", static_cast<int>(150 * u))), 100.0 * u, cross * 0.42);
+    double       v     = static_cast<double>(cfgInt("plugin:gloview:strip_height", 150));
+    if (v == 150.0) // the registered default — treat as unset and scale for DPI
+        v *= uiScale();
+    return std::clamp(v, 100.0, cross * 0.42);
 }
 
 double Overview::stripOffset() const {
@@ -851,6 +901,7 @@ void Overview::open() {
             }
     }
 
+    const bool wasActive = m_active; // reopened mid-close: `true` was already emitted and no `false` has fired yet
     m_active    = true;
     m_opening   = true;
     m_reflowing = false;
@@ -859,7 +910,8 @@ void Overview::open() {
     m_animStart = std::chrono::steady_clock::now();
     hideLayers(); // fade bars out (no-op unless hide_top/overlay_layers set)
     damage();
-    emitOverviewState(m, true); // every entry path (toggle/expo/desktop) funnels through here
+    if (!wasActive) // keep the event edge-balanced: exactly one `true` per active episode
+        emitOverviewState(m, true); // every entry path (toggle/expo/desktop) funnels through here
 }
 
 void Overview::close() {
@@ -1674,7 +1726,9 @@ void Overview::renderStrip() const {
         std::vector<LRect> reals;
         for (size_t i = 0; i < m_strip.size(); ++i) {
             const auto& it2 = m_strip[i];
-            if (it2.isAll || it2.isPlus || it2.id == m_pressStripWsId)
+            // same filter as stripInsertIndexAt/reorderWorkspaces, so the bar is drawn in
+            // the gap the content actually lands in (special cards don't count as slots)
+            if (!reorderableCard(it2) || it2.id == m_pressStripWsId)
                 continue;
             LRect c = it2.card;
             c.x += slide.x + scroll.x;
@@ -2498,6 +2552,14 @@ int Overview::stripIndexOfWs(int wsId) const {
     return -1;
 }
 
+// reorderWorkspaces()' id-list filter, shared with stripInsertIndexAt and the insertion-bar
+// renderer. Counting a card here that reorderWorkspaces skips (the special/scratchpad card:
+// negative id, sorts FIRST, shown by default while a scratchpad is open) shifted every drop
+// one slot right of the drawn bar and made far-edge drops silently no-op (`to >= n`).
+bool Overview::reorderableCard(const StripItem& it) {
+    return !it.isAll && !it.isPlus && it.id > 0 && it.ws.lock();
+}
+
 int Overview::stripInsertIndexAt(double lx, double ly) const {
     const LRect  b    = stripBand();
     const double slop = 40.0;
@@ -2505,10 +2567,10 @@ int Overview::stripInsertIndexAt(double lx, double ly) const {
         return -1; // released outside the band → cancel
     const bool   horiz = stripHorizontal();
     const double p     = horiz ? lx : ly;
-    int          slot  = 0; // count surviving real cards whose center precedes the cursor
+    int          slot  = 0; // count surviving reorderable cards whose center precedes the cursor
     for (size_t i = 0; i < m_strip.size(); ++i) {
         const auto& it = m_strip[i];
-        if (it.isAll || it.isPlus || it.id == m_pressStripWsId)
+        if (!reorderableCard(it) || it.id == m_pressStripWsId)
             continue;
         const LRect  c      = stripCardAt(i);
         const double center = horiz ? (c.x + c.w / 2.0) : (c.y + c.h / 2.0);
@@ -2581,10 +2643,11 @@ void Overview::reorderWorkspaces(int insertSlot) {
     }
 
     // real-card ws ids in strip order (ascending by m_id); skip All / "+" / special / dead
+    // via reorderableCard — the SAME filter stripInsertIndexAt used to compute insertSlot
     std::vector<WORKSPACEID> ids;
     int                      from = -1;
     for (const auto& it : m_strip) {
-        if (it.isAll || it.isPlus || it.id <= 0 || !it.ws.lock())
+        if (!reorderableCard(it))
             continue;
         if (it.id == m_pressStripWsId)
             from = static_cast<int>(ids.size());
@@ -2882,7 +2945,10 @@ void Overview::onKey(const IKeyboard::SKeyEvent& e, bool& cancel) {
         // this self-switch as external.
         int n = 0;
         for (const auto& it : m_strip) {
-            if (it.isPlus || it.isAll) // count only real workspace cards
+            // count only NUMBERED workspace cards: the special/scratchpad card (id < 0)
+            // sorts first, so counting it would shift every number key by one — and
+            // switchToWorkspace on a special ws can't be committed (changeWorkspace no-ops)
+            if (it.isPlus || it.isAll || it.id <= 0)
                 continue;
             if (n++ == ws) {
                 switchToWorkspace(it);
