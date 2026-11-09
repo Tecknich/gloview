@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -23,6 +24,10 @@
 namespace Render {
 class ITexture;
 class IFramebuffer;
+class CRenderContext;
+}
+namespace Event {
+struct SRenderStageEvent;
 }
 
 #include "layout.hpp"
@@ -48,12 +53,11 @@ inline ConfigRegistry g_config;
 
 class Overview;
 
-// 0.56 interop: custom bus event "gloview:overview" (TYPE_MONITOR, TYPE_STRING name,
+// Custom bus event "gloview:overview" (TYPE_MONITOR, TYPE_STRING name,
 // TYPE_BOOL open) — emitted per monitor on open and on full close, so in-process
 // consumers (bars) can hide themselves. Delivery is DEFERRED via an event-loop timer
 // (never from inside a render pass or a m_views iteration); per monitor the open/close
 // edges alternate strictly: one `true` per active episode, then one `false`.
-// Both functions are no-ops on 0.55.4.
 void registerOverviewEvent(HANDLE handle);   // PLUGIN_INIT
 void unregisterOverviewEvent(HANDLE handle); // PLUGIN_EXIT (mandatory: unload never cleans custom events)
 
@@ -83,8 +87,8 @@ class Manager {
     Overview* dragSource() const; // the view with a live tile drag, if any (cross-monitor drag)
 
     // true between RENDER_BEGIN and RENDER_POST — stages only renderMonitor() emits.
-    // Offscreen workspace re-renders (hyprcapture's FULL_FAKE renderWorkspace) never
-    // bracket, so views can tell a real frame from a capture pass.
+    // Offscreen workspace re-renders (a plugin's renderWorkspace, or 0.57's workspace
+    // screencopy) never bracket, so views can tell a real frame from a capture pass.
     bool inMonitorPass() const { return m_inMonitorPass; }
 
   private:
@@ -137,19 +141,19 @@ class Overview {
     void toggleAllWorkspaces(); // open (or, if already open, toggle) the all-workspaces "expo" main view
 
     // wired to Hyprland's event bus / render pass
-    void renderStage(eRenderStage stage);
-    void queueOverlayPasses(); // pass-building only (no state advance): shared by the live frame and offscreen capture re-renders
-    void renderBackdrop() const;
-    void renderStrip() const;
-    void renderStripWindows() const; // live window surfaces inside the strip cards
-    void renderPreviews() const;  // static tiles' chrome (shadow/border/backing), drawn under the strip
-    void renderMainWindows() const; // live window surfaces for the main-area tiles
-    void renderDragTile() const;  // the picked-up tile's chrome, drawn over the strip
-    void renderDragWindow() const; // the picked-up tile's live surface
-    void renderDragStripCard() const; // the picked-up workspace card's chrome, drawn over the strip
-    void renderCursorOnTop() const; // redraw the SW cursor over our overlay
+    void renderStage(const Event::SRenderStageEvent& ev);
+    void queueOverlayPasses(Render::CRenderContext& ctx); // pass-building only (no state advance): shared by the live frame and offscreen capture re-renders
+    void renderBackdrop(Render::CRenderContext& ctx) const;
+    void renderStrip(Render::CRenderContext& ctx) const;
+    void renderStripWindows(Render::CRenderContext& ctx) const; // live window surfaces inside the strip cards
+    void renderPreviews(Render::CRenderContext& ctx) const;  // static tiles' chrome (shadow/border/backing), drawn under the strip
+    void renderMainWindows(Render::CRenderContext& ctx) const; // live window surfaces for the main-area tiles
+    void renderDragTile(Render::CRenderContext& ctx) const;  // the picked-up tile's chrome, drawn over the strip
+    void renderDragWindow(Render::CRenderContext& ctx) const; // the picked-up tile's live surface
+    void renderDragStripCard(Render::CRenderContext& ctx) const; // the picked-up workspace card's chrome, drawn over the strip
+    void renderCursorOnTop(Render::CRenderContext& ctx) const; // redraw the SW cursor over our overlay
     bool isAboveLayer(const std::string& ns) const;
-    void renderAboveLayers() const; // re-render opted-in TOP/OVERLAY layer surfaces on top of the overview
+    void renderAboveLayers(Render::CRenderContext& ctx) const; // re-render opted-in TOP/OVERLAY layer surfaces on top of the overview
     bool onMouseButton(const IPointer::SButtonEvent& e);
     bool onMouseAxis(const IPointer::SAxisEvent& e); // scroll the workspace strip when it overflows
     void onMouseMove();
@@ -196,8 +200,8 @@ class Overview {
     };
 
     struct StripItem {
-        PHLWORKSPACEREF       ws;
-        int                   id = 0;
+        PHLWORKSPACEREF       ws;  // card IDENTITY (All / "+" cards: empty)
+        std::optional<uint32_t> num; // ORDER key only: set iff ws is a NORMAL numbered workspace (never special/named/All/+)
         bool                  active = false;
         bool                  isPlus = false;
         bool                  isAll  = false; // the leading "All workspaces" card (toggles the expo view)
@@ -240,8 +244,8 @@ class Overview {
     // stale-size buffer) reuse its last good snapshot instead of re-snapshotting into a
     // stretched/black thumbnail. Persists across the per-open tile/strip rebuilds.
     std::unordered_map<void*, LRect>      m_snapGeom;
-    // 0.56 only (unused on 0.55, where the FB lives on the CWindow): the last snapshot
-    // FB per window, keyed like m_snapGeom; the weak ref lets dead windows' FBs free.
+    // the last snapshot FB per window, keyed like m_snapGeom; the weak ref lets dead
+    // windows' FBs free.
     std::unordered_map<void*, std::pair<PHLWINDOWREF, SP<Render::IFramebuffer>>> m_snapFBs;
     // layer surfaces (bars/popups) we faded out while up, with their pre-hide alpha
     // goal, so deactivate() restores them exactly — even if config changed meanwhile.
@@ -266,7 +270,7 @@ class Overview {
     mutable SP<Render::ITexture>          m_closeGlyph;       // cached "✕" for the desktop-mode close buttons
 
     // "+" add-workspace pop-in: the freshly created card scales up from its center.
-    int                                   m_newCardId    = 0; // workspace id of the animating card (0 = none)
+    PHLWORKSPACEREF                       m_newCardWs;          // workspace of the animating card (empty = none)
     bool                                  m_newCardAnim  = false;
     std::chrono::steady_clock::time_point m_newCardStart;
     // Strong refs (NOT setPersistent pins): a plugin-held SP keeps the workspace
@@ -294,7 +298,7 @@ class Overview {
     // strip-card drag-to-reorder. A press lands on exactly one of {window tile, strip card},
     // so these share m_pressX/Y, m_grabDX/DY and m_dragX/Y with the tile drag above.
     int    m_pressStrip     = -1;    // m_strip index armed on press (real ws cards only), else -1
-    int    m_pressStripWsId = 0;     // dragged card's workspace id; survives a mid-drag buildStrip()
+    PHLWORKSPACEREF m_pressStripWs;  // dragged card's workspace; survives a mid-drag buildStrip()
     bool   m_stripDragging  = false; // the card drag passed the 8px threshold
     int    m_stripDropIdx   = -1;    // insertion slot among real cards [0..nReal-1], -1 = outside band
     // config helpers
@@ -336,16 +340,16 @@ class Overview {
     LRect  tileContentBox(size_t i, const LRect& slot) const; // slot fitted to the window's aspect
     LRect  dragBox() const;                        // the picked-up tile's box at the cursor
     LRect  dragCardBox() const;                    // the picked-up workspace card following the cursor (full card size)
-    int    stripIndexOfWs(int wsId) const;         // m_strip index of the real card with this ws id, else -1
+    int    stripIndexOfWs(const PHLWORKSPACEREF& ws) const; // m_strip index of the NUMBERED card for this ws, else -1
     // card takes part in drag-reorder: a real, live, NUMBERED workspace (special/scratchpad
-    // cards have id < 0 and are excluded). Shared by stripInsertIndexAt, the insertion-bar
+    // cards have no number and are excluded). Shared by stripInsertIndexAt, the insertion-bar
     // renderer and reorderWorkspaces so all three index spaces agree.
     static bool reorderableCard(const StripItem& it);
     int    stripInsertIndexAt(double lx, double ly) const; // reorder insertion slot among reorderable cards; -1 outside band
     void   reorderWorkspaces(int insertSlot);      // move window contents so the dragged card takes slot `insertSlot`
     // tile chrome (shadow/border/backing/title). onMon overrides the target monitor
     // (scale + label clamping) when the tile is drawn on a foreign monitor mid-drag.
-    void   drawPreviewTile(size_t i, const LRect& slot, bool lift, PHLMONITOR onMon = nullptr) const;
+    void   drawPreviewTile(Render::CRenderContext& ctx, size_t i, const LRect& slot, bool lift, PHLMONITOR onMon = nullptr) const;
     void   switchToWorkspace(const StripItem& it, int slideDir = 0);
     void   dropOnWorkspace(const PHLWINDOW& w, const StripItem& it);
     void   swapTiles(int a, int b);           // drag a preview onto another → swap the two windows' places (real layout + overview)

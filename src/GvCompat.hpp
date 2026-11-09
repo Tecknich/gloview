@@ -1,31 +1,19 @@
 #pragma once
-// Hyprland 0.55 -> 0.56 API compatibility.
+// Hyprland 0.57 accessors used by gloview.
 //
-// 0.56 moved compositor-owned state into dedicated trackers/controllers:
-//   g_pCompositor->m_monitors              -> State::monitorState()->monitors()
-//   g_pCompositor->getMonitorFromCursor()  -> State::monitorState()->query().vec(cursor).run()
-//   g_pCompositor->getWorkspaceByID(id)    -> State::workspaceState()->query().id(id).run()
-//   g_pCompositor->createNewWorkspace(...) -> State::workspaceState()->create(...)
-//   g_pCompositor->getWorkspaces()         -> State::workspaceState()->workspaces()
-//   g_pCompositor->m_windows               -> Desktop::windowState()->windows()
-//   g_pCompositor->moveWindowToWorkspaceSafe -> Desktop::globalWindowController()->moveWindowToWorkspace
-//   w->isFullscreen()/isEffectiveInternalFSMode -> Fullscreen::controller()
-//   w->m_realPosition / m_realSize (protected) -> positionAnimation()/sizeAnimation()
-//   ls->m_alpha                            -> ls->alpha()[Desktop::View::LS_ALPHA_FADE]
-//   g_pPointerManager                      -> Pointer::mgr()
-// and managers/PointerManager.hpp moved to pointer/PointerManager.hpp.
-//
-// Detected by header presence (not version macros) so ONE tree builds against both
-// the 0.55.4 headers and 0.56+; callers must only use the Compat:: wrappers below.
-// The probe is for the OLD path (removed in 0.56): probing a 0.56-only path would
-// false-positive whenever newer system headers sit in /usr/include behind a -I'd
-// 0.55 prefix (__has_include searches the whole include path, not just the winner).
-#include <hyprland/src/Compositor.hpp>
-#include <hyprland/src/desktop/view/Window.hpp>
-#include <hyprland/src/desktop/view/LayerSurface.hpp>
+// main targets Hyprland 0.57 ONLY. 0.55.4 and 0.56.x are served by hyprpm.toml's
+// commit_pins (the last commits verified on them); this guard fails the build loudly
+// instead of producing a .so with an ABI mismatch. 0.57 moved CHLWorkspace to
+// workspace/HLWorkspace.hpp (ids became variant<numbered, special>) and CWindow to
+// desktop/view/window/Window.hpp.
+#if !__has_include(<hyprland/src/workspace/HLWorkspace.hpp>)
+#error "gloview main requires Hyprland >= 0.57 headers. Older releases build the hyprpm.toml commit_pins entry."
+#endif
 
-#if !__has_include(<hyprland/src/managers/PointerManager.hpp>)
-#define GV_HYPRLAND_056 1
+#include <hyprland/src/Compositor.hpp>
+#include <hyprland/src/desktop/view/window/Window.hpp>
+#include <hyprland/src/desktop/view/LayerSurface.hpp>
+#include <hyprland/src/workspace/HLWorkspace.hpp>
 #include <hyprland/src/pointer/PointerManager.hpp>
 #include <hyprland/src/state/MonitorState.hpp>
 #include <hyprland/src/state/MonitorQuery.hpp>
@@ -35,119 +23,104 @@
 #include <hyprland/src/desktop/state/GlobalWindowController.hpp>
 #include <hyprland/src/managers/fullscreen/FullscreenController.hpp>
 #include <hyprland/src/managers/input/InputManager.hpp>
-#else
-#include <hyprland/src/managers/PointerManager.hpp>
-#endif
+
+#include <cstdint>
+#include <optional>
 
 namespace gloview::Compat {
 
 inline const std::vector<PHLMONITOR>& monitors() {
-#ifdef GV_HYPRLAND_056
     return State::monitorState()->monitors();
-#else
-    return g_pCompositor->m_monitors;
-#endif
 }
 
 inline PHLMONITOR monitorFromCursor() {
-#ifdef GV_HYPRLAND_056
     return State::monitorState()->query().vec(g_pInputManager->getMouseCoordsInternal()).run();
-#else
-    return g_pCompositor->getMonitorFromCursor();
-#endif
 }
 
-inline PHLWORKSPACE workspaceByID(WORKSPACEID id) {
-#ifdef GV_HYPRLAND_056
-    return State::workspaceState()->query().id(id).run();
-#else
-    return g_pCompositor->getWorkspaceByID(id);
-#endif
+// 0.57: WorkspaceID is variant<SWorkspaceNumberedID(uint32), SWorkspaceSpecialID>. Named
+// NORMAL workspaces carry the SPECIAL-ID variant too, so branch on type()/numberedID(),
+// never on a sentinel int. gloview's IDENTITY for a workspace is the object itself
+// (PHLWORKSPACE / PHLWORKSPACEREF); the number is only an ORDER key for numbered ones.
+inline bool isSpecial(const PHLWORKSPACE& ws) {
+    return ws && ws->type() == ::Workspace::eWorkspaceType::SPECIAL;
 }
 
-inline PHLWORKSPACE createWorkspace(WORKSPACEID id, MONITORID monid, const std::string& name = "", bool isEmpty = true) {
-#ifdef GV_HYPRLAND_056
-    return State::workspaceState()->create(id, monid, name, isEmpty);
-#else
-    return g_pCompositor->createNewWorkspace(id, monid, name, isEmpty);
-#endif
+// the workspace's number iff it is a NORMAL numbered workspace (named + special -> nullopt)
+inline std::optional<uint32_t> wsNumber(const PHLWORKSPACE& ws) {
+    if (!ws || ws->type() != ::Workspace::eWorkspaceType::NORMAL)
+        return std::nullopt;
+    return ws->numberedID();
 }
 
-// weak-ref filtered view over every workspace (iterate + .lock(), both versions)
+inline PHLWORKSPACE workspaceByNumber(uint32_t n) {
+    if (n == 0)
+        return nullptr;
+    return State::workspaceState()->query().numbered(::Workspace::SWorkspaceNumberedID{n}).run();
+}
+
+// lowest unused workspace number >= from
+inline uint32_t lowestFreeNumber(uint32_t from = 1) {
+    if (from == 0)
+        from = 1;
+    while (workspaceByNumber(from))
+        ++from;
+    return from;
+}
+
+// Creates a NUMBERED workspace (nullptr on a duplicate number). 0.57 emits
+// workspace.createdLate (Lua `workspace.created`) only from ws->ready(): the caller calls it
+// once the workspace is set up, as Hyprland's own actions do. ready() is idempotent.
+// Like 0.56's create(), a workspace rule may bind it to a monitor other than `m`.
+inline PHLWORKSPACE createNumberedWorkspace(uint32_t n, const PHLMONITOR& m, bool isEmpty) {
+    if (n == 0 || !m)
+        return nullptr;
+    return State::workspaceState()->createNumbered(::Workspace::SWorkspaceNumberedID{n}, m, {}, isEmpty);
+}
+
+// weak-ref filtered view over every workspace (iterate + .lock())
 inline auto workspaces() {
-#ifdef GV_HYPRLAND_056
     return State::workspaceState()->workspaces();
-#else
-    return g_pCompositor->getWorkspaces();
-#endif
 }
 
 inline const std::vector<PHLWINDOW>& windows() {
-#ifdef GV_HYPRLAND_056
     return Desktop::windowState()->windows();
-#else
-    return g_pCompositor->m_windows;
-#endif
 }
 
 // the "silent" move (no follow/focus) — gloview handles follow/focus itself
 inline void moveWindowToWorkspace(const PHLWINDOW& w, const PHLWORKSPACE& ws) {
-#ifdef GV_HYPRLAND_056
     Desktop::globalWindowController()->moveWindowToWorkspace(w, ws);
-#else
-    g_pCompositor->moveWindowToWorkspaceSafe(w, ws);
-#endif
 }
 
-// works for CWindow and CLayerSurface (both derive the geometric-animated mixin in 0.56)
+// works for CWindow and CLayerSurface (both derive the geometric-animated mixin)
 template <typename T>
 inline decltype(auto) realPosition(const SP<T>& v) {
-#ifdef GV_HYPRLAND_056
     return v->positionAnimation();
-#else
-    return (v->m_realPosition);
-#endif
 }
 
 template <typename T>
 inline decltype(auto) realSize(const SP<T>& v) {
-#ifdef GV_HYPRLAND_056
     return v->sizeAnimation();
-#else
-    return (v->m_realSize);
-#endif
 }
 
 inline bool isInternalFullscreen(const PHLWINDOW& w) { // "fullscreen, not just maximized"
-#ifdef GV_HYPRLAND_056
     return Fullscreen::controller()->getFullscreenModes(w).internal == Fullscreen::FSMODE_FULLSCREEN;
-#else
-    return w->isEffectiveInternalFSMode(FSMODE_FULLSCREEN);
-#endif
 }
 
 inline bool isFullscreen(const PHLWINDOW& w) {
-#ifdef GV_HYPRLAND_056
     return Fullscreen::controller()->isFullscreen(w);
-#else
-    return w->isFullscreen();
-#endif
 }
 
 inline auto* pointerMgr() {
-#ifdef GV_HYPRLAND_056
     return Pointer::mgr().get();
-#else
-    return g_pPointerManager.get();
-#endif
 }
 
 inline PHLANIMVAR<float>& lsAlpha(const PHLLS& ls) {
-#ifdef GV_HYPRLAND_056
     return ls->alpha()[Desktop::View::LS_ALPHA_FADE];
-#else
-    return ls->m_alpha;
-#endif
+}
+
+// CWindow::m_pinned became a bit in the m_state mask (eWindowState) in 0.57.
+inline bool isPinned(const PHLWINDOW& w) {
+    return w && static_cast<bool>(w->m_state & Desktop::View::WINDOW_STATE_PINNED);
 }
 
 } // namespace gloview::Compat

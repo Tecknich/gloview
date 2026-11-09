@@ -4,10 +4,11 @@
   inputs = {
     # Pin a tagged Hyprland release, not `main`: ABI must match the compositor, and main's
     # dep tree is intermittently unbuildable (e.g. a missing pango buildInput in
-    # hyprland-guiutils broke it on 2026-06-27). v0.55.4 is the version this was developed +
-    # proven against (`nix build .#gloview` succeeds on real NixOS). Downstream should set
+    # hyprland-guiutils broke it on 2026-06-27). v0.57.2 is the version this targets: 0.57
+    # moved per-frame render state into Render::CRenderContext and reworked workspace ids, so
+    # main will not compile against older releases. Downstream should set
     # `inputs.hyprland.follows` to build the plugin against THEIR exact Hyprland.
-    hyprland.url = "github:hyprwm/Hyprland?ref=v0.55.4";
+    hyprland.url = "github:hyprwm/Hyprland?ref=v0.57.2";
     nixpkgs.follows = "hyprland/nixpkgs";
     systems.follows = "hyprland/systems";
   };
