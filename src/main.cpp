@@ -8,6 +8,7 @@
 #include <hyprland/src/config/values/types/FloatValue.hpp>
 #include <hyprland/src/config/values/types/StringValue.hpp>
 #include <hyprland/src/plugins/PluginAPI.hpp>
+#include <hyprland/src/ipc/s1/S1.hpp>
 
 extern "C" {
 #include <lauxlib.h>
@@ -40,32 +41,6 @@ void addStr(const char* name, Config::STRING fallback) {
     auto v = makeShared<Config::Values::CStringValue>(name, "", fallback);
     HyprlandAPI::addConfigValueV2(g_handle, v);
     gloview::g_config.strings[name] = v;
-}
-
-SDispatchResult dispToggle(std::string) {
-    if (g_manager)
-        g_manager->toggle();
-    return {.success = true};
-}
-SDispatchResult dispOpen(std::string) {
-    if (g_manager)
-        g_manager->open();
-    return {.success = true};
-}
-SDispatchResult dispClose(std::string) {
-    if (g_manager)
-        g_manager->close();
-    return {.success = true};
-}
-SDispatchResult dispDesktop(std::string) {
-    if (g_manager)
-        g_manager->toggleDesktop();
-    return {.success = true};
-}
-SDispatchResult dispAllWorkspaces(std::string) {
-    if (g_manager)
-        g_manager->toggleAllWorkspaces();
-    return {.success = true};
 }
 
 int luaToggle(lua_State*) {
@@ -185,25 +160,23 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         g_manager = nullptr;
         g_managerOwned.reset();
         // Throw so Hyprland ejects the plugin (it catches this and runs unloadPlugin).
-        // Returning normally instead kept a half-alive instance loaded — dispatchers and
+        // Returning normally instead kept a half-alive instance loaded — commands and
         // config registered but no render hooks — which then blocked every later load
         // attempt (two instances can't hook shouldRenderWindow twice).
         throw std::runtime_error("[gloview] initialization failed");
     }
 
-    gloview::registerOverviewEvent(handle); // "gloview:overview" custom bus event (no-op on 0.55)
+    gloview::registerOverviewEvent(handle); // "gloview:overview" custom bus event (hyprstatus consumes it)
 
-    HyprlandAPI::addDispatcherV2(handle, "gloview:toggle", dispToggle);
-    HyprlandAPI::addDispatcherV2(handle, "gloview:open", dispOpen);
-    HyprlandAPI::addDispatcherV2(handle, "gloview:close", dispClose);
-    HyprlandAPI::addDispatcherV2(handle, "gloview:desktop", dispDesktop); // toggle the free-arrange desktop mode
-    HyprlandAPI::addDispatcherV2(handle, "gloview:allworkspaces", dispAllWorkspaces); // open/toggle the all-workspaces expo view
+    // Plugin dispatchers are gone on 0.57 (HyprlandAPI::addDispatcherV2 is a stub that returns
+    // false): hl.plugin.gloview.* (below) is the bind surface, the hyprctl commands the
+    // exact, non-eval invoke path.
 
     // hyprctl command (exact, not lua-evaluated) — reliable invoke path:  hyprctl gloview
-    HyprlandAPI::registerHyprCtlCommand(handle, SHyprCtlCommand{
-                                                    .name  = "gloview",
-                                                    .exact = true,
-                                                    .fn    = [](eHyprCtlOutputFormat, std::string) -> std::string {
+    HyprlandAPI::registerHyprCtlCommand(handle, IPC::Socket1::SCommand{
+                                                    .name    = "gloview",
+                                                    .match   = IPC::Socket1::COMMAND_MATCH_EXACT,
+                                                    .handler = [](const IPC::Socket1::SRequest&) -> IPC::Socket1::SResponse {
                                                         if (g_manager)
                                                             g_manager->toggle();
                                                         return "ok\n";
@@ -213,10 +186,10 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     // close-only (no-op if not open): dismiss the overlay before unloading.
     // Unloading mid-render with the overview up tears down the render hooks while
     // an in-flight frame still references them → Hyprland crash.
-    HyprlandAPI::registerHyprCtlCommand(handle, SHyprCtlCommand{
-                                                    .name  = "gloviewclose",
-                                                    .exact = true,
-                                                    .fn    = [](eHyprCtlOutputFormat, std::string) -> std::string {
+    HyprlandAPI::registerHyprCtlCommand(handle, IPC::Socket1::SCommand{
+                                                    .name    = "gloviewclose",
+                                                    .match   = IPC::Socket1::COMMAND_MATCH_EXACT,
+                                                    .handler = [](const IPC::Socket1::SRequest&) -> IPC::Socket1::SResponse {
                                                         if (g_manager)
                                                             g_manager->close();
                                                         return "ok\n";
@@ -228,10 +201,10 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     // animation), this drops all overlay state + the recapture timer synchronously,
     // so the next frame renders with no plugin-owned pass elements and dlclose can't
     // free a callback that is still referenced mid-frame. Makes reload deterministic.
-    HyprlandAPI::registerHyprCtlCommand(handle, SHyprCtlCommand{
-                                                    .name  = "gloviewunload",
-                                                    .exact = true,
-                                                    .fn    = [](eHyprCtlOutputFormat, std::string) -> std::string {
+    HyprlandAPI::registerHyprCtlCommand(handle, IPC::Socket1::SCommand{
+                                                    .name    = "gloviewunload",
+                                                    .match   = IPC::Socket1::COMMAND_MATCH_EXACT,
+                                                    .handler = [](const IPC::Socket1::SRequest&) -> IPC::Socket1::SResponse {
                                                         if (g_manager)
                                                             g_manager->hardClose();
                                                         return "ok\n";
@@ -239,10 +212,10 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                                 });
 
     // free-arrange desktop mode toggle:  hyprctl gloviewdesktop
-    HyprlandAPI::registerHyprCtlCommand(handle, SHyprCtlCommand{
-                                                    .name  = "gloviewdesktop",
-                                                    .exact = true,
-                                                    .fn    = [](eHyprCtlOutputFormat, std::string) -> std::string {
+    HyprlandAPI::registerHyprCtlCommand(handle, IPC::Socket1::SCommand{
+                                                    .name    = "gloviewdesktop",
+                                                    .match   = IPC::Socket1::COMMAND_MATCH_EXACT,
+                                                    .handler = [](const IPC::Socket1::SRequest&) -> IPC::Socket1::SResponse {
                                                         if (g_manager)
                                                             g_manager->toggleDesktop();
                                                         return "ok\n";
@@ -250,10 +223,10 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                                 });
 
     // all-workspaces (expo) view toggle:  hyprctl gloviewall — opens into expo if closed
-    HyprlandAPI::registerHyprCtlCommand(handle, SHyprCtlCommand{
-                                                    .name  = "gloviewall",
-                                                    .exact = true,
-                                                    .fn    = [](eHyprCtlOutputFormat, std::string) -> std::string {
+    HyprlandAPI::registerHyprCtlCommand(handle, IPC::Socket1::SCommand{
+                                                    .name    = "gloviewall",
+                                                    .match   = IPC::Socket1::COMMAND_MATCH_EXACT,
+                                                    .handler = [](const IPC::Socket1::SRequest&) -> IPC::Socket1::SResponse {
                                                         if (g_manager)
                                                             g_manager->toggleAllWorkspaces();
                                                         return "ok\n";

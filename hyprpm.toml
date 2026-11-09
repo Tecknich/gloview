@@ -1,3 +1,18 @@
+[repository]
+name = "gloview"
+authors = ["Vergil"]
+# commit_pins map a Hyprland release commit to a known-good gloview commit: users on that
+# release build the pin; anything newer (or unpinned) builds repo HEAD. main requires
+# Hyprland >= 0.57 headers and #errors on older ones (src/GvCompat.hpp).
+commit_pins = [
+    # Hyprland 0.55.4 -> the commit that verified the 0.55.4 build (GvCompat dual-build)
+    ["a0136d8c04687bb36eb8a28eb9d1ff92aea99704", "55b8bd6c0c7e1c9698a7b8ce535d4f9ffb03b29d"], # v0.55.4
+    # Hyprland 0.56.x -> last pre-0.57 main (PR #2 merge)
+    ["36b2e0cfe0c6094dbc47bd42a437431315bb3087", "9143ab4311bbea7172d830a4708ed47dc231a6e1"], # v0.56.0
+    ["5c9377c15f85c50648f35ca5a213754f95b93ca0", "9143ab4311bbea7172d830a4708ed47dc231a6e1"], # v0.56.1
+    ["efb50993780079460b0cbed1363e2166a2de1d9f", "9143ab4311bbea7172d830a4708ed47dc231a6e1"], # v0.56.2
+]
+
 [gloview]
 description = "Minimal macOS-style window overview"
 authors = ["Vergil"]

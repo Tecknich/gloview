@@ -7,6 +7,9 @@ A better macOS Mission Control-style overview plugin for Hyprland
 
 ## Install
 
+Requires Hyprland 0.57 (Lua config). On 0.55.4 and 0.56.x, hyprpm automatically builds the
+last commit verified on that release (`commit_pins` in `hyprpm.toml`).
+
 Via hyprpm:
 
 ```sh
@@ -29,7 +32,7 @@ inputs.gloview = { url = "github:fedsfarm/gloview"; inputs.hyprland.follows = "h
 wayland.windowManager.hyprland = {
   enable = true;
   plugins = [ inputs.gloview.packages.${pkgs.system}.gloview ];
-  settings.bind = [ "SUPER, TAB, gloview:toggle" ];
+  # bind it from your Lua config: hl.bind("SUPER + TAB", hl.plugin.gloview.toggle)
 };
 ```
 
@@ -47,9 +50,10 @@ hot-reloads into the running Hyprland.
 
 ## Usage
 
-Dispatchers: `gloview:toggle`, `gloview:open`, `gloview:close`, `gloview:desktop`,
-`gloview:allworkspaces` (the all-workspaces "expo" view — opens into it if closed)
-Or `hyprctl gloview` / `gloviewclose` / `gloviewdesktop` / `gloviewall`
+Lua functions: `hl.plugin.gloview.toggle`, `.open`, `.close`, `.desktop`,
+`.allworkspaces` (the all-workspaces "expo" view — opens into it if closed).
+Or `hyprctl gloview` / `gloviewclose` / `gloviewdesktop` / `gloviewall`.
+(Hyprland 0.57 removed plugin dispatchers, so the old `gloview:*` dispatchers are gone.)
 
 Multi-monitor: the overview opens on **every** monitor at once, each showing its own
 workspaces/windows. Pointer and keyboard input act on the monitor under the cursor;
@@ -67,15 +71,9 @@ hl.bind("SUPER + SHIFT + TAB", hl.plugin.gloview.desktop)
 hl.bind("SUPER + CTRL + TAB", hl.plugin.gloview.allworkspaces)
 ```
 
-```ini
-bind = SUPER, TAB, gloview:toggle
-bind = SUPER SHIFT, TAB, gloview:desktop
-bind = SUPER CTRL, TAB, gloview:allworkspaces
-```
-
 ## Config
 
-All keys live under `plugin:gloview:*`. Colors are `0xAARRGGBB` integers.
+Set options from Lua with `hl.config({ plugin = { gloview = { ... } } })` (example below). Colors are `0xAARRGGBB` integers.
 
 - **`rows`** (default) — macOS-like: previews keep their aspect ratio and are packed into balanced rows, with the row count chosen to make the previews as large as possible. Reads spatially like the real desktop.
 - **`grid`** — uniform cells, one preview centered in each.
@@ -123,7 +121,7 @@ All keys live under `plugin:gloview:*`. Colors are `0xAARRGGBB` integers.
 | `key_workspace` | key names | `1,2,3,4,5,6,7,8,9,0` | Each key switches to the Nth strip card's workspace, for real (slot position = card index) |
 | `exit_on_click` | bool (0/1) | `1` | Click on empty space dismisses the overview |
 | `exit_on_switch` | bool (0/1) | `0` | Dismiss when the live workspace changes underneath (e.g. a keybind) |
-| `show_all_workspaces` | bool (0/1) | `0` | Main area shows every window on the monitor (expo), not just the displayed workspace. Toggle live with `gloview:allworkspaces`, the `key_all_workspaces` key, or the strip's "All" card |
+| `show_all_workspaces` | bool (0/1) | `0` | Main area shows every window on the monitor (expo), not just the displayed workspace. Toggle live with `hl.plugin.gloview.allworkspaces`, the `key_all_workspaces` key, or the strip's "All" card |
 | `show_empty` | bool (0/1) | `1` | Keep empty workspaces as strip cards |
 | `show_special` | bool (0/1) | `0` | Include the special (scratchpad) workspace as a strip card |
 | `strip_all_card` | bool (0/1) | `0` | Show a leading "All workspaces" card on the strip that toggles the expo view |
@@ -209,76 +207,6 @@ supersedes the older `bar_position` (top/bottom only); set `anchor` and it wins.
             },
         },
     })
-```
-
-### hyprland.conf
-
-```ini
-plugin {
-    gloview {
-        layout = rows
-        gap = 34
-        padding = 80
-        padding_top = 40
-        padding_bottom = 70
-        max_scale = 1.0
-        duration = 200
-        preview_round = 12
-        blur = 1
-
-        anchor = top
-        strip_offset = 0
-        strip_height = 150
-        strip_margin = 22
-        strip_gap = 18
-        strip_card_round = 10
-
-        focus_follows_mouse       = 1
-        scroll_switches_workspace = 1
-        passthrough_keys          = 1
-        exit_on_click             = 1
-        exit_on_switch            = 0
-
-        key_close     = escape
-        key_next_workspace = tab
-        key_prev_workspace = shift+tab
-        key_activate  = enter
-        key_close_window = d
-        key_left      = left
-        key_right     = right
-        key_up        = up
-        key_down      = down
-        key_desktop   = shift
-        key_all_workspaces = a
-        key_workspace = 1,2,3,4,5,6,7,8,9,0
-
-        show_all_workspaces     = 0
-        show_empty              = 1
-        show_special            = 0
-        strip_all_card          = 0
-        drag_to_swap            = 1
-        switch_on_drop          = 0
-        switch_on_new_workspace = 1
-
-        hide_top_layers     = 0
-        hide_overlay_layers = 0
-        above_namespaces    =
-        debug_logs = 0
-
-        select_border_size  = 3
-        select_border       = 0xf066ccff
-        close_button_color  = 0xe6e23b3b
-        backdrop_color      = 0x73070a10
-        strip_band_color    = 0x24ffffff
-        strip_card_color    = 0x3a0e131c
-        strip_active_color  = 0x4d1c2c44
-        strip_active_border = 0xf0ffffff
-        strip_hover_border  = 0x80ffffff
-        strip_plus_color    = 0xd0eef4ff
-        shadow_color        = 0x70000000
-        hover_border        = 0xf0ffffff
-    }
-}
 ```
 
 ## Donate
